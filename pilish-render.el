@@ -2272,7 +2272,7 @@ Uses `font-lock-face' to survive tree-sitter refontification."
          (path (pilish--tool-display-path-string
                 (pilish--tool-arg-path args))))
     (pcase raw-tool-name
-      ("bash"
+      ((or "bash" "ysh")
        (let ((cmd (pilish--tool-display-value-string
                    (pilish--tool-arg-get args :command)
                    "...")))
