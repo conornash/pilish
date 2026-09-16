@@ -95,6 +95,102 @@ assistant message.  This table exists only while the current assistant message
 is being generated; completed tool execution remains keyed separately by tool
 call ID in `pilish--live-tool-blocks'.")
 
+(defconst pilish--stream-delta-render-interval 0.05
+  "Seconds between coalesced renders of streamed text and thinking deltas.
+Pi emits one `message_update' per streamed token.  Rendering every token
+multiplies markdown/tree-sitter change-hook work by the token rate and grows
+quadratically with message size.  Pending deltas are concatenated and inserted
+at this cadence, and flushed before any non-delta event, so display order stays
+authoritative.  Internal constant, not a user option.")
+
+(defvar-local pilish--pending-stream-deltas nil
+  "Reversed list of (KIND . STRING) streaming deltas awaiting rendering.
+KIND is `text' or `thinking'.  Consecutive entries with the same kind are
+concatenated at flush time.")
+
+(defvar-local pilish--stream-delta-flush-timer nil
+  "The one pending one-shot streaming delta flush timer, or nil.")
+
+(defconst pilish--md-ts-known-change-hooks
+  '(md-ts--font-lock-record-dirty-side-effect-bounds
+    md-ts--font-lock-record-stale-side-effect-bounds
+    md-ts--before-change-check-link-reference-definition
+    md-ts--after-change-flush-link-reference-links)
+  "Complete set of md-ts 0.4 per-change hooks known to Pilish.
+Full history replay may suspend exactly these hooks; unknown hooks remain
+installed because Pilish has no cost or correctness contract for them.")
+
+(defconst pilish--md-ts-expensive-change-hooks
+  '(md-ts--font-lock-record-stale-side-effect-bounds)
+  "Expensive subset of `pilish--md-ts-known-change-hooks' for stream flushes.
+The stale-side-effect recorder queries tree-sitter over regions that grow with
+the buffer.  Coupled to md-ts internals: if md-ts renames it, streaming
+suspension silently degrades to running it (correct, only slower).
+
+The paired link-reference before/after hooks are deliberately NOT in this list.
+md-ts cheaply prefilters irrelevant edits, while real definition changes must
+invalidate distant fontified link buttons.
+
+`md-ts--font-lock-record-dirty-side-effect-bounds' is deliberately NOT in
+this list.  It is cheap and keeps md-ts's modified tick and bounded dirty
+bounds in sync.  Removing it makes every suspended flush look like an
+untracked full-buffer rewrite, so md-ts pushes a full-buffer dirty range on
+the next fontification and the dirty-range list grows by one per flush.")
+
+(defun pilish--md-ts-change-hook-p (hook)
+  "Return non-nil when HOOK is a known md-ts 0.4 per-change hook.
+md-ts-mode installs buffer-local before/after-change hooks that query
+tree-sitter on every buffer modification.  Their cost grows with buffer size,
+so bulk replay would otherwise pay it quadratically.  jit-lock's own
+`jit-lock-after-change' hook is deliberately kept.
+
+Only explicit members of `pilish--md-ts-known-change-hooks' are suspended.
+Renamed or future md-ts hooks remain installed (correct, potentially slower)
+rather than being suppressed without a known correctness contract."
+  (memq hook pilish--md-ts-known-change-hooks))
+
+(defun pilish--md-ts-expensive-change-hook-p (hook)
+  "Return non-nil when HOOK is an expensive md-ts per-change hook.
+See `pilish--md-ts-expensive-change-hooks'."
+  (memq hook pilish--md-ts-expensive-change-hooks))
+
+(defmacro pilish--with-md-ts-change-hooks-suspended (predicate &rest body)
+  "Run BODY with md-ts per-change hooks matching PREDICATE removed.
+PREDICATE is a function of one hook symbol.  Use
+`pilish--md-ts-change-hook-p' for the single bulk history-replay epoch (one
+untracked epoch, one dirty range) and
+`pilish--md-ts-expensive-change-hook-p' for coalesced streaming flushes (md-ts
+keeps its cheap dirty-tick bookkeeping, so repeated suspended inserts do not
+accumulate full-buffer dirty ranges).
+
+Restores the hook lists afterwards, preserving whether they were
+buffer-local.  `jit-lock-after-change' stays installed, so visible text is
+still marked for fontification at the next redisplay."
+  (declare (indent 1) (debug t))
+  `(let ((pilish--saved-before-local
+          (local-variable-p 'before-change-functions))
+         (pilish--saved-after-local
+          (local-variable-p 'after-change-functions))
+         (pilish--saved-before before-change-functions)
+         (pilish--saved-after after-change-functions))
+     (unwind-protect
+         (progn
+           (setq-local before-change-functions
+                       (if (listp before-change-functions)
+                           (seq-remove ,predicate before-change-functions)
+                         before-change-functions))
+           (setq-local after-change-functions
+                       (if (listp after-change-functions)
+                           (seq-remove ,predicate after-change-functions)
+                         after-change-functions))
+           ,@body)
+       (if pilish--saved-before-local
+           (setq-local before-change-functions pilish--saved-before)
+         (kill-local-variable 'before-change-functions))
+       (if pilish--saved-after-local
+           (setq-local after-change-functions pilish--saved-after)
+         (kill-local-variable 'after-change-functions)))))
+
 (defun pilish--history-postprocessing-deferred-p ()
   "Return non-nil when history display post-processing is currently deferred."
   pilish--defer-history-postprocessing)
@@ -263,8 +359,12 @@ case of no headings is O(n) with no allocations."
   "Display streaming message DELTA at the streaming marker.
 Transforms ATX headings (outside code blocks) by adding one # level
 to keep our setext H1 separators as the top-level document structure.
-Modification hooks fire normally so jit-lock marks inserted text for
-fontification; tree-sitter re-parses at the C level on each insert."
+During a coalesced flush, Pilish suspends the sole hook in
+`pilish--md-ts-expensive-change-hooks',
+`md-ts--font-lock-record-stale-side-effect-bounds'.  `jit-lock-after-change',
+`md-ts--font-lock-record-dirty-side-effect-bounds', and md-ts's paired
+reference-definition hooks remain installed.  Tree-sitter still re-parses at
+the C level on each insertion."
   (when (and delta pilish--streaming-marker)
     (let* ((inhibit-read-only t)
            (delta (pilish--render-safe-string delta))
@@ -659,6 +759,92 @@ CONTENT is ignored - we use what was already streamed."
              (lambda (pos)
                (pilish--adjust-pos-after-region-replacements
                 pos replacements)))))))))
+
+(defun pilish--stream-delta-kind (event)
+  "Return `text', `thinking', or nil for a renderable streaming EVENT.
+Single source of truth for the delta kinds the coalescer understands."
+  (when (equal (plist-get event :type) "message_update")
+    (pcase (plist-get (plist-get event :assistantMessageEvent) :type)
+      ("text_delta" 'text)
+      ("thinking_delta" 'thinking))))
+
+(defun pilish--schedule-stream-delta-flush ()
+  "Arm the one-shot streaming delta flush timer for the current buffer."
+  (setq pilish--stream-delta-flush-timer
+        (run-at-time pilish--stream-delta-render-interval nil
+                     #'pilish--flush-stream-deltas
+                     (current-buffer))))
+
+(defun pilish--queue-stream-delta (kind delta)
+  "Queue streaming DELTA of KIND (`text' or `thinking') for rendering.
+DELTA may be a non-string value; it is normalized with
+`pilish--render-safe-string' so every queued entry is a string.
+Consecutive same-kind deltas are joined once at flush time so the renderer
+performs one markdown-changing insertion per kind run instead of one per token."
+  (when delta
+    (let ((delta (if (stringp delta) delta
+                   (pilish--render-safe-string delta))))
+      (unless (string-empty-p delta)
+        (push (cons kind delta) pilish--pending-stream-deltas)
+        (unless pilish--stream-delta-flush-timer
+          (pilish--schedule-stream-delta-flush))))))
+
+(defun pilish--flush-stream-deltas (&optional buffer)
+  "Stage BUFFER's pending delta batch, clear flush state, then render it.
+Timer callback for `pilish--stream-delta-flush-timer'.  Also called
+synchronously before any non-delta event so text, thinking, and tool blocks
+keep their authoritative order.  If rendering signals, log once and discard
+the rest of the staged batch rather than risk duplicating partial output;
+canonical history or reload is the recovery path."
+  (let ((buffer (or buffer (current-buffer))))
+    ;; Cheap pre-check without switching buffers: high-frequency non-delta
+    ;; events call this on every token.
+    (when (and (buffer-live-p buffer)
+               (or (buffer-local-value 'pilish--pending-stream-deltas buffer)
+                   (buffer-local-value 'pilish--stream-delta-flush-timer buffer)))
+      (with-current-buffer buffer
+        (when (or pilish--pending-stream-deltas
+                  pilish--stream-delta-flush-timer)
+          (when (timerp pilish--stream-delta-flush-timer)
+            (cancel-timer pilish--stream-delta-flush-timer))
+          (setq pilish--stream-delta-flush-timer nil)
+          (let ((pending (nreverse pilish--pending-stream-deltas)))
+            (setq pilish--pending-stream-deltas nil)
+            ;; Coalesced deltas still insert into a growing transcript.  Suspend
+            ;; only the explicitly allowlisted stale-side-effect hook; jit-lock
+            ;; plus md-ts's dirty-tick and reference-definition hooks remain for
+            ;; fontification bookkeeping and distant-link correctness.
+            (condition-case err
+                (pilish--with-md-ts-change-hooks-suspended
+                    #'pilish--md-ts-expensive-change-hook-p
+                  (while pending
+                    (let ((kind (car (car pending)))
+                          (chunks (list (cdr (car pending)))))
+                      (setq pending (cdr pending))
+                      (while (and pending (eq (car (car pending)) kind))
+                        (push (cdr (car pending)) chunks)
+                        (setq pending (cdr pending)))
+                      (let ((text (mapconcat #'identity (nreverse chunks) "")))
+                        (pcase kind
+                          ('text (pilish--display-message-delta text))
+                          ('thinking
+                           (pilish--display-thinking-delta text)))))))
+              (error
+               (message "pilish: stream delta flush failed: %s"
+                        (error-message-string err))
+               nil))))))))
+
+(defun pilish--cancel-stream-delta-flush ()
+  "Cancel any armed streaming delta flush timer and drop pending deltas.
+Idempotent.  Used for buffer kill and render-artifact teardown during session
+or history reset.  Process exit does not call this discard helper: it first
+attempts `pilish--flush-stream-deltas',
+which leaves timer and queue state clear and, on failure, logs and discards the
+staged batch."
+  (when (timerp pilish--stream-delta-flush-timer)
+    (cancel-timer pilish--stream-delta-flush-timer))
+  (setq pilish--stream-delta-flush-timer nil
+        pilish--pending-stream-deltas nil))
 
 (defun pilish--ready-to-drain-followups-p ()
   "Return non-nil when a queued follow-up may become the next prompt."
@@ -1105,6 +1291,7 @@ which asks upfront before any buffers are touched."
   (when (derived-mode-p 'pilish-chat-mode)
     (pilish--cancel-inactivity-timer)
     (pilish--cancel-tool-update-flush)
+    (pilish--cancel-stream-delta-flush)
     (pilish--cancel-tool-cooling)
     (pilish--invalidate-prompt-start-wait)
     (pilish--set-activity-phase "idle" 'teardown t)
@@ -1179,12 +1366,16 @@ which asks upfront before any buffers are touched."
       (setq pilish--state
             (plist-put pilish--state :last-error error-msg))
       (unwind-protect
-          (unless (process-get process 'pilish-exit-error-rendered)
-            (pilish--display-process-exit-error
-             error-msg
-             (plist-get response :stderr)
-             (plist-get response :exitCode))
-            (process-put process 'pilish-exit-error-rendered t))
+          ;; Flush coalesced stream text first: it was produced before the exit,
+          ;; so it must land before the exit banner rather than after it.
+          (progn
+            (pilish--flush-stream-deltas)
+            (unless (process-get process 'pilish-exit-error-rendered)
+              (pilish--display-process-exit-error
+               error-msg
+               (plist-get response :stderr)
+               (plist-get response :exitCode))
+              (process-put process 'pilish-exit-error-rendered t)))
         (pilish--cancel-tool-update-flush)
         (pilish--finalize-live-tool-blocks
          'pilish-tool-block-error)
@@ -1215,10 +1406,31 @@ which asks upfront before any buffers are touched."
 (defun pilish--handle-display-event (event)
   "Handle EVENT for display purposes.
 Updates buffer-local state and renders display updates."
-  ;; Most events update state first.  Settlement's return value gates its
-  ;; completion effects below, since it may belong to an older run.
-  (unless (equal (plist-get event :type) "agent_settled")
-    (pilish--update-state-from-event event))
+  ;; Protocol state is authoritative and must advance before fallible display
+  ;; work.  Settlement's return value says whether this event released waiting
+  ;; work; preserve it from the single state update to gate completion effects.
+  (let* ((settlement-released (pilish--update-state-from-event event))
+         (delta-kind (pilish--stream-delta-kind event)))
+    ;; Coalesced stream deltas must be painted before any handled event that can
+    ;; insert chat text or start a block, so ordering between text, thinking,
+    ;; and tool blocks stays authoritative.  Delta events keep accumulating
+    ;; until the flush cadence.  (`queue_update' bypasses this handler and only
+    ;; refreshes the mode line, so it needs no flush.)
+    (unless delta-kind
+      (pilish--flush-stream-deltas))
+    (when (and settlement-released
+               (equal (plist-get event :type) "agent_settled"))
+      (when pilish--aborted
+        (pilish--clear-followup-queue))
+      (pilish--set-aborted nil)
+      (pilish--set-activity-phase "idle")
+      (pilish--process-followup-queue))
+    (when delta-kind
+      (when (eq delta-kind 'text)
+        (pilish--set-activity-phase "replying"))
+      (pilish--queue-stream-delta
+       delta-kind
+       (plist-get (plist-get event :assistantMessageEvent) :delta))))
   ;; Then handle display
   (pcase (plist-get event :type)
     ("agent_start"
@@ -1271,11 +1483,10 @@ Updates buffer-local state and renders display updates."
     ("message_update"
      (when-let* ((msg-event (plist-get event :assistantMessageEvent))
                  (event-type (plist-get msg-event :type)))
+       ;; Stream deltas were queued from the single classification above.
+       ;; Dispatch the remaining block events here.
        (pcase event-type
          ("text_start") ; No-op: text block started, nothing to render
-         ("text_delta"
-          (pilish--set-activity-phase "replying")
-          (pilish--display-message-delta (plist-get msg-event :delta)))
          ("text_end"
           ;; Text block ended — finalize any active table that may have
           ;; a trailing row without newline (backstop for streaming).
@@ -1283,8 +1494,6 @@ Updates buffer-local state and renders display updates."
           (setq pilish--streaming-table-candidate nil))
          ("thinking_start"
           (pilish--display-thinking-start))
-         ("thinking_delta"
-          (pilish--display-thinking-delta (plist-get msg-event :delta)))
          ("thinking_end"
           (pilish--display-thinking-end (plist-get msg-event :content)))
          ((or "toolcall_start" "toolcall_delta" "toolcall_end")
@@ -1367,7 +1576,7 @@ Updates buffer-local state and renders display updates."
     ("compaction_end"
      (pilish--handle-compaction-end-event event))
     ("agent_end"
-     ;; Defensively drop pending previews and cancel the flush timer; any
+     ;; Defensively drop pending tool previews and cancel their flush timer; any
      ;; tool still running here is aborted and its block is finalized below.
      (pilish--cancel-tool-update-flush)
      (pilish--set-canonical-messages
@@ -1375,13 +1584,7 @@ Updates buffer-local state and renders display updates."
      (pilish--display-agent-end)
      (pilish--update-hot-tail-boundary)
      (pilish--queue-tool-cooling-outside-hot-tail))
-    ("agent_settled"
-     (when (pilish--update-state-from-event event)
-       (when pilish--aborted
-         (pilish--clear-followup-queue))
-       (pilish--set-aborted nil)
-       (pilish--set-activity-phase "idle")
-       (pilish--process-followup-queue)))
+    ("agent_settled" nil)
     ("auto_retry_start"
      (pilish--display-retry-start event))
     ("auto_retry_end"
@@ -1481,6 +1684,7 @@ the compatibility pending overlay slot so buffer and render state stay
 consistent.  Pending deferred cooling is invalidated first.  Tree-sitter
 overlays are left alone."
   (pilish--cancel-tool-update-flush)
+  (pilish--cancel-stream-delta-flush)
   (pilish--cancel-tool-cooling)
   (remove-overlays (point-min) (point-max) 'pilish-tool-block t)
   (remove-overlays (point-min) (point-max) 'pilish-diff-overlay t)
@@ -5544,10 +5748,9 @@ single semantic owner at point before projecting only that owner's label.  This
 keeps deeply nested/recovery trees linear and fails ambiguity closed before
 expensive projection.  All node types, bounds, labels, and destinations are
 copied to a plist before deleting the parser; no caller observes a tree node
-after its parser lifetime.  Installed `md-ts-mode' 0.3 creates its own local
-inline parsers lazily during fontification and exposes no public link resolver.
-This parser never changes text, overlays, font-lock properties, visibility, or
-the mode's parser set."
+after its parser lifetime.  `md-ts-mode' exposes no public resolver with the
+detached semantic metadata contract Pilish needs.  This parser never changes
+text, overlays, font-lock properties, visibility, or the mode's parser set."
   (let ((parser (treesit-parser-create 'markdown-inline nil t)))
     (when pilish--semantic-link-resolver-parsers
       (push parser pilish--semantic-link-resolver-parsers))
@@ -7051,20 +7254,26 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
             (gc-cons-threshold
              (max gc-cons-threshold
                   pilish--history-replay-gc-threshold)))
-        (pilish--clear-render-artifacts)
-        (erase-buffer)
-        (insert (pilish--format-startup-header) "\n")
-        (when (vectorp messages)
-          (let ((pilish--defer-history-postprocessing t))
-            (pilish--display-history-messages messages)))
-        (goto-char (point-max))
-        (unless (bolp) (insert "\n"))
-        (pilish--set-message-start-marker nil)
-        (pilish--set-streaming-marker nil)
-        (pilish--update-hot-tail-boundary)
-        (pilish--cool-completed-tool-blocks-outside-hot-tail)
-        (pilish--postprocess-history-buffer)
-        (goto-char (point-max))))))
+        ;; Replaying and cooling a large transcript performs hundreds of small
+        ;; rewrites.  Suspend every known md-ts 0.4 per-change hook for the
+        ;; whole rebuild.  This is one untracked epoch, so md-ts records one
+        ;; dirty range and jit-lock fontifies visible text at the next redisplay.
+        (pilish--with-md-ts-change-hooks-suspended
+            #'pilish--md-ts-change-hook-p
+          (pilish--clear-render-artifacts)
+          (erase-buffer)
+          (insert (pilish--format-startup-header) "\n")
+          (when (vectorp messages)
+            (let ((pilish--defer-history-postprocessing t))
+              (pilish--display-history-messages messages)))
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (pilish--set-message-start-marker nil)
+          (pilish--set-streaming-marker nil)
+          (pilish--update-hot-tail-boundary)
+          (pilish--cool-completed-tool-blocks-outside-hot-tail)
+          (pilish--postprocess-history-buffer)
+          (goto-char (point-max)))))))
 
 (provide 'pilish-render)
 
