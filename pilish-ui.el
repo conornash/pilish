@@ -78,7 +78,7 @@
 (declare-function pilish-session-browser "pilish-browse")
 
 ;; pilish-menu.el (menu and session commands)
-(declare-function pilish-menu "pilish-menu")
+(declare-function pilish-menu "pilish-menu" nil t)
 (declare-function pilish-new-session "pilish-menu")
 (declare-function pilish-export-html "pilish-menu")
 (declare-function pilish-compact "pilish-menu")
@@ -1076,7 +1076,9 @@ of the current session in the selected frame."
         (input-buf (pilish--get-input-buffer)))
     (when (buffer-live-p input-buf)
       (dolist (win (get-buffer-window-list input-buf nil))
-        (ignore-errors (delete-window win))))
+        (when (and (window-live-p win)
+                   (window-deletable-p win))
+          (delete-window win))))
     (when (buffer-live-p chat-buf)
       (dolist (win (get-buffer-window-list chat-buf nil))
         (with-selected-window win
@@ -2000,7 +2002,8 @@ currently selected window."
   "Delete windows in INPUT-WINS except TARGET."
   (dolist (win input-wins)
     (unless (eq win target)
-      (ignore-errors (delete-window win)))))
+      (when (window-deletable-p win)
+        (delete-window win)))))
 
 (defun pilish--paired-input-window (chat-win input-buf)
   "Return input window below CHAT-WIN showing INPUT-BUF, or nil."
@@ -2473,7 +2476,7 @@ Stores the result in CHAT-BUF and emits a minibuffer notice when available."
    "assets/pilish-logo.svg"
    (file-name-directory
     (or load-file-name
-        (ignore-errors (symbol-file 'pilish--make-separator 'defun))
+        (symbol-file 'pilish--make-separator 'defun)
         (locate-library "pilish-ui")
         "pilish-ui.el")))
   "Absolute path of the canonical Hornbridge logo SVG shipped with Pilish.
