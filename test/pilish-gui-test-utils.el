@@ -41,6 +41,36 @@
 (defvar pilish-gui-test--session nil
   "Current test session plist with :chat-buffer, :input-buffer, :process.")
 
+(defvar pilish-gui-test--failure-snapshot nil
+  "Diagnostics captured before the fresh-session teardown.
+The fresh-session macro fills this while the session still exists, so
+the runner can show chat buffer and process state for failures whose
+session is otherwise unwound away before diagnostics run.")
+
+(defun pilish-gui-test--capture-failure-snapshot ()
+  "Record session diagnostics before the fresh-session teardown."
+  (setq pilish-gui-test--failure-snapshot nil)
+  (when-let ((session pilish-gui-test--session))
+    (let ((chat-buf (plist-get session :chat-buffer))
+          (proc (plist-get session :process))
+          (parts nil))
+      (when (buffer-live-p chat-buf)
+        (with-current-buffer chat-buf
+          (push (format "status: %S" pilish--status) parts)
+          (push (concat "--- chat buffer ---\n"
+                        (buffer-substring-no-properties (point-min) (point-max))
+                        "--- end chat buffer ---")
+                parts)))
+      (when (and proc (process-live-p proc))
+        (push (format "process: %s exit=%s events=%s last=%S"
+                      (process-status proc)
+                      (process-exit-status proc)
+                      (or (process-get proc 'pilish-gui-test-event-count) 0)
+                      (process-get proc 'pilish-gui-test-last-event))
+              parts))
+      (setq pilish-gui-test--failure-snapshot
+            (and parts (mapconcat #'identity (nreverse parts) "\n"))))))
+
 (defun pilish-gui-test-session-active-p ()
   "Return t if a test session is active and healthy."
   (and pilish-gui-test--session
@@ -239,6 +269,7 @@ FORMS must start with a literal session options plist containing an explicit
                 (pilish-gui-test--macro-session-forms
                  'pilish-gui-test-with-fresh-session forms)))
     `(progn
+       (setq pilish-gui-test--failure-snapshot nil)
        (pilish-gui-test-end-session)
        (pilish-gui-test-start-session nil ',options)
        (unwind-protect
@@ -246,22 +277,30 @@ FORMS must start with a literal session options plist containing an explicit
                               (plist-get (plist-get pilish-gui-test--session :backend)
                                          :label)))
              (progn ,@body))
+         (pilish-gui-test--capture-failure-snapshot)
          (pilish-gui-test-end-session)))))
 
 ;;;; Waiting
 
-(defun pilish-gui-test-streaming-p ()
-  "Return t if status is `streaming'."
+(defun pilish-gui-test-idle-p ()
+  "Return t when the chat buffer's `pilish--status' is `idle'."
   (when-let ((chat-buf (plist-get pilish-gui-test--session :chat-buffer)))
     (with-current-buffer chat-buf
-      (eq pilish--status 'streaming))))
+      (eq pilish--status 'idle))))
 
 (defun pilish-gui-test-wait-for-idle (&optional timeout)
-  "Wait until streaming stops, up to TIMEOUT seconds."
+  "Wait until the session returns to `idle', up to TIMEOUT seconds.
+
+Waits on `pilish--status' rather than the absence of `streaming': a
+just-sent prompt sits in `sending' until the backend starts the run,
+so treating anything non-streaming as idle returns before the turn
+begins.  Deliberately does not use `pilish--session-busy-p', which
+also covers model changes and session transitions that would keep
+tests hanging for reasons unrelated to turn activity."
   (let ((timeout (or timeout pilish-test-gui-timeout))
         (proc (plist-get pilish-gui-test--session :process)))
     (let ((done (pilish-test-wait-until
-                 (lambda () (not (pilish-gui-test-streaming-p)))
+                 (lambda () (pilish-gui-test-idle-p))
                  timeout
                  pilish-test-poll-interval
                  proc)))
@@ -290,50 +329,24 @@ Returns non-nil if the buffer is stable before TIMEOUT."
          pilish-test-poll-interval
          proc)))))
 
-(defun pilish-gui-test-wait-for-response-start (post-send-tick event-count &optional timeout)
-  "Wait until backend activity starts after a send.
-POST-SEND-TICK is the chat buffer tick captured immediately after the local
-send path returns.  EVENT-COUNT is the process event counter captured before
-sending."
-  (let ((timeout (or timeout pilish-test-rpc-timeout))
-        (proc (plist-get pilish-gui-test--session :process))
-        (chat-buf (plist-get pilish-gui-test--session :chat-buffer)))
-    (pilish-test-wait-until
-     (lambda ()
-       (or (pilish-gui-test-streaming-p)
-           (> (or (process-get proc 'pilish-gui-test-event-count) 0)
-              (or event-count 0))
-           (and post-send-tick
-                (buffer-live-p chat-buf)
-                (> (with-current-buffer chat-buf
-                     (buffer-chars-modified-tick))
-                   post-send-tick))))
-     timeout
-     pilish-test-poll-interval
-     proc)))
-
 ;;;; Sending Messages
 
 (defun pilish-gui-test-send (text &optional no-wait)
-  "Send TEXT to pi. Waits for response unless NO-WAIT is t."
+  "Send TEXT to pi and wait for the turn to settle unless NO-WAIT is t.
+
+Waiting on real idle state keeps this helper from returning while the
+prompt is still being submitted; a return before the turn starts can
+queue the next prompt as a follow-up and race the assertions.
+`pilish-gui-test-wait-for-chat-settled' then guards the final render
+and delta flush."
   (pilish-gui-test-ensure-session)
-  (let* ((proc (plist-get pilish-gui-test--session :process))
-         (input-buf (plist-get pilish-gui-test--session :input-buffer))
-         (chat-buf (plist-get pilish-gui-test--session :chat-buffer))
-         (event-count (or (process-get proc 'pilish-gui-test-event-count) 0))
-         post-send-tick)
+  (let ((input-buf (plist-get pilish-gui-test--session :input-buffer)))
     (when input-buf
       (with-current-buffer input-buf
         (erase-buffer)
         (insert text)
         (pilish-send)))
-    (setq post-send-tick
-          (and (buffer-live-p chat-buf)
-               (with-current-buffer chat-buf
-                 (buffer-chars-modified-tick))))
     (unless no-wait
-      (should (pilish-gui-test-wait-for-response-start
-               post-send-tick event-count))
       (should (pilish-gui-test-wait-for-idle))
       (should (pilish-gui-test-wait-for-chat-settled))
       (redisplay))))
