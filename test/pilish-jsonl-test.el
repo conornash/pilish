@@ -599,6 +599,36 @@ reordering."
       (should (equal (plist-get weird :rawRole) "weird"))
       (should (equal (plist-get weird :preview) "odd text")))))
 
+(ert-deftest pilish-test-jsonl-summary-message-roles-retain-full-text ()
+  "Legacy summary-message projection keeps text beyond its preview."
+  (let* ((text (concat (make-string 220 ?x) " full-summary-needle"))
+         (result (pilish-test--jsonl-project-lines
+                  (list pilish-test--jsonl-header
+                        (pilish-test--jsonl-msg
+                         "b1" nil 0
+                         (list :role "branchSummary" :summary text))
+                        (pilish-test--jsonl-msg
+                         "c1" "b1" 1
+                         (list :role "compactionSummary" :summary text)))))
+         (tree (plist-get result :tree)))
+    (dolist (id '("b1" "c1"))
+      (let ((node (pilish-test--jsonl-find tree id)))
+        (should (= (length (plist-get node :preview)) 200))
+        (should (equal (plist-get node :summary) text))))))
+
+(ert-deftest pilish-test-jsonl-compaction-projects-summary ()
+  "Compaction projection retains its semantic summary for tree search."
+  (let* ((result (pilish-test--jsonl-project-lines
+                  (list pilish-test--jsonl-header
+                        (pilish-test--jsonl-entry
+                         "compaction" "c1" nil 0
+                         :summary "Retained compaction summary"
+                         :tokensBefore 4096))))
+         (node (pilish-test--jsonl-find (plist-get result :tree) "c1")))
+    (should (equal (plist-get node :summary)
+                   "Retained compaction summary"))
+    (should (= (plist-get node :tokensBefore) 4096))))
+
 (ert-deftest pilish-test-jsonl-malformed-payloads-degrade ()
   "Null messages, null content, and null blocks degrade, never crash.
 pi parses session files without validation; old or hand-edited files
@@ -997,22 +1027,215 @@ present-but-null; strings do not."
   (should-not (pilish--jsonl-arg-number '(:offset "5") :offset))
   (should-not (pilish--jsonl-arg-number '(:limit 5) :offset)))
 
+(ert-deftest pilish-test-jsonl-identical-duplicate-entries-canonicalize ()
+  "A historical Pi duplicate segment canonicalizes without data loss.
+Old Pi fork files can contain a repeated header and byte-equivalent
+entries.  Identical nonempty-id repeats denote one occurrence: root and
+answer remain navigable, the answer remains current, and no ambiguity
+diagnostic is emitted."
+  (let* ((root (pilish-test--jsonl-msg
+                "root" nil 0 '(:role "user" :content "question")))
+         (answer (pilish-test--jsonl-msg
+                  "answer" "root" 1
+                  '(:role "assistant" :content "answer")))
+         (session
+          (pilish-test--jsonl-session-at
+           (list pilish-test--jsonl-header
+                 root
+                 ;; The historical bug repeated both header and entries.
+                 (copy-tree pilish-test--jsonl-header)
+                 (copy-tree root)
+                 answer)))
+         (entries (plist-get session :entries))
+         (built (pilish-jsonl-build-tree entries))
+         (projected (pilish-jsonl-project-session-file
+                     (plist-get session :path))))
+    (should (equal (mapcar (lambda (entry) (plist-get entry :id))
+                           (append entries nil))
+                   '("root" "root" "answer")))
+    (should (= (length (plist-get built :tree)) 1))
+    (should-not (plist-get built :diagnostic))
+    (should (equal (plist-get projected :leafId) "answer"))
+    (should-not (plist-get projected :diagnostic))
+    (should (pilish-test--jsonl-find (plist-get projected :tree) "root"))
+    (should (pilish-test--jsonl-find (plist-get projected :tree) "answer"))
+    (should (pilish-jsonl-navigation-target session "root"))
+    (should (pilish-jsonl-navigation-target session "answer"))))
+
 (ert-deftest pilish-test-jsonl-duplicate-id-cycle-terminates ()
-  "Duplicate ids closing a cycle terminate instead of looping forever.
-pi generates collision-checked unique ids, so only hand-edited files
-hit this; the expansion guard keeps building total."
-  (let* ((built (pilish-test--jsonl-build-lines
-                 (list pilish-test--jsonl-header
-                       (pilish-test--jsonl-msg
-                        "dup1" nil 0 '(:role "user" :content "root"))
-                       (pilish-test--jsonl-msg
-                        "mid" "dup1" 1 '(:role "user" :content "middle"))
-                       ;; Same id as the root, parented into the chain.
-                       (pilish-test--jsonl-msg
-                        "dup1" "mid" 2 '(:role "user" :content "dup")))))
-         (tree (plist-get built :tree)))
-    (should (= (length tree) 1))
-    (should (equal (plist-get (plist-get (aref tree 0) :entry) :id) "dup1"))))
+  "Differing duplicate ids diagnose ambiguity without hiding safe data.
+The later `dup1' occurrence wins canonically and closes a malformed
+parent cycle with `mid'; that cyclic component remains bounded/dropped,
+while unrelated `safe' stays displayable and navigable.  The ambiguous
+id itself is never a navigation or current-position target."
+  (let* ((session
+          (pilish-test--jsonl-session-at
+           (list pilish-test--jsonl-header
+                 (pilish-test--jsonl-msg
+                  "dup1" nil 0 '(:role "user" :content "first dup"))
+                 (pilish-test--jsonl-msg
+                  "mid" "dup1" 1 '(:role "user" :content "middle"))
+                 (pilish-test--jsonl-msg
+                  "unsafe-child" "dup1" 2
+                  '(:role "assistant" :content "ambiguous ancestry"))
+                 (pilish-test--jsonl-msg
+                  "safe" nil 3 '(:role "assistant" :content "safe turn"))
+                 ;; Same id, different content/parent: genuinely ambiguous.
+                 (pilish-test--jsonl-msg
+                  "dup1" "mid" 4 '(:role "user" :content "later dup")))))
+         (built (pilish-jsonl-build-tree (plist-get session :entries)))
+         (projected (pilish-jsonl-project-session-file
+                     (plist-get session :path))))
+    (should (equal (plist-get built :ambiguousIds) '("dup1")))
+    (should (string-match-p "dup1" (plist-get built :diagnostic)))
+    (should (pilish-test--jsonl-find-raw
+             (plist-get built :tree) "safe"))
+    (should (equal (plist-get projected :ambiguousIds) '("dup1")))
+    (should (string-match-p "dup1" (plist-get projected :diagnostic)))
+    (should (pilish-test--jsonl-find (plist-get projected :tree) "safe"))
+    (should-not (pilish-jsonl-current-projected-id session))
+    (should-not (pilish-jsonl-navigation-target session "dup1"))
+    ;; `mid' rewinds to ambiguous dup1; the assistant child would target
+    ;; itself, but its rewrite chain still has to choose a dup1 occurrence.
+    (should-not (pilish-jsonl-navigation-target session "mid"))
+    (should-not (pilish-jsonl-navigation-target session "unsafe-child"))
+    (should (pilish-jsonl-navigation-target session "safe"))
+    (should-not (pilish-jsonl-navigation-lines
+                 (plist-get session :path) "dup1"))
+    (should-not (pilish-jsonl-navigation-lines
+                 (plist-get session :path) "mid"))
+    (should-not (pilish-jsonl-navigation-lines
+                 (plist-get session :path) "unsafe-child"))
+    (should (pilish-jsonl-navigation-lines
+             (plist-get session :path) "safe"))))
+
+(ert-deftest pilish-test-jsonl-projected-leaf-duplicate-cycle-is-bounded ()
+  "Direct raw projection diagnoses a finite differing-duplicate cycle.
+The nested value is finite but its ids imply dup → mid → dup, and the
+visible root and leaf are distinct `dup' occurrences.  Bound hash reads
+so a regression fails rather than hanging; the ambiguous leaf resolves
+to nil and the diagnostic survives even when the cycle leaves no rows."
+  (let* ((tree
+          (vector
+           (list :entry
+                 '(:type "message" :id "dup" :parentId "mid"
+                   :timestamp "2026-01-01T00:00:00Z"
+                   :message (:role "user" :content "root dup"))
+                 :children
+                 (vector
+                  (list :entry
+                        '(:type "custom" :id "mid" :parentId "dup"
+                          :timestamp "2026-01-01T00:00:01Z")
+                        :children
+                        (vector
+                         (list :entry
+                               '(:type "message" :id "dup" :parentId "mid"
+                                 :timestamp "2026-01-01T00:00:02Z"
+                                 :message (:role "assistant"
+                                           :content "leaf dup"))
+                               :children (vector))))))))
+         (real-gethash (symbol-function 'gethash))
+         (reads 0)
+         resolved)
+    (cl-letf (((symbol-function 'gethash)
+               (lambda (key table &optional default)
+                 (cl-incf reads)
+                 (when (> reads 64)
+                   (ert-fail "projected-leaf parent cycle did not terminate"))
+                 (funcall real-gethash key table default))))
+      (setq resolved
+            (pilish--jsonl-resolve-projected-leaf-id tree "dup")))
+    (should-not resolved)
+    (let ((projected (pilish-jsonl-project-tree tree "dup")))
+      (should (equal (plist-get projected :tree) []))
+      (should-not (plist-get projected :leafId))
+      (should (equal (plist-get projected :ambiguousIds) '("dup")))
+      (should (string-match-p "dup" (plist-get projected :diagnostic))))))
+
+(ert-deftest pilish-test-jsonl-project-tree-harvests-built-ambiguity ()
+  "The two-argument builder-to-projector API preserves ambiguity.
+`pilish-jsonl-build-tree' has already canonicalized the duplicate, so
+projection cannot rediscover it by scanning entries.  It must harvest
+the surviving raw node's :ambiguousId marker: the filtered ambiguous
+leaf cannot resolve to its apparently-current visible parent, and the
+warning remains present without an explicit third argument."
+  (let* ((entries
+          [(:type "message" :id "u" :timestamp "2026-01-01T00:00:00Z"
+            :message (:role "user" :content "visible parent"))
+           (:type "custom" :id "d" :parentId "u"
+            :timestamp "2026-01-01T00:00:01Z" :data 1)
+           (:type "custom" :id "d" :parentId "u"
+            :timestamp "2026-01-01T00:00:02Z" :data 2)])
+         (built (pilish-jsonl-build-tree entries))
+         ;; Deliberately exercise the established two-argument form.
+         (projected (pilish-jsonl-project-tree
+                     (plist-get built :tree) (plist-get built :leafId)))
+         (raw-d (pilish-test--jsonl-find-raw
+                 (plist-get built :tree) "d")))
+    (should (plist-get raw-d :ambiguousId))
+    (should (equal (mapcar (lambda (node) (plist-get node :id))
+                           (append (plist-get projected :tree) nil))
+                   '("u")))
+    (should-not (plist-get projected :leafId))
+    (should (equal (plist-get projected :ambiguousIds) '("d")))
+    (should (string-match-p "d" (plist-get projected :diagnostic)))))
+
+(ert-deftest pilish-test-jsonl-filtered-duplicate-preserves-marker-boundary ()
+  "Projection records ambiguity even when the duplicate row is filtered.
+A unique visible child remains current and displayable, but
+`:ambiguousParent' tells the browser not to claim the promoted canonical
+parent as active.  Continuation also refuses the ambiguous raw chain."
+  (let* ((session
+          (pilish-test--jsonl-session-at
+           (list pilish-test--jsonl-header
+                 (pilish-test--jsonl-msg
+                  "top" nil 0 '(:role "user" :content "top"))
+                 (pilish-test--jsonl-entry
+                  "custom" "dup-custom" "top" 1 :customType "first")
+                 (pilish-test--jsonl-entry
+                  "custom" "dup-custom" "top" 2 :customType "later")
+                 (pilish-test--jsonl-msg
+                  "leaf" "dup-custom" 3
+                  '(:role "assistant" :content "unique leaf")))))
+         (projected (pilish-jsonl-project-session-file
+                     (plist-get session :path)))
+         (tree (plist-get projected :tree))
+         (leaf (pilish-test--jsonl-find tree "leaf")))
+    (should (equal (plist-get projected :ambiguousIds) '("dup-custom")))
+    (should (equal (plist-get projected :leafId) "leaf"))
+    (should (plist-get leaf :ambiguousParent))
+    (should-not (pilish-jsonl-navigation-target session "leaf"))))
+
+(ert-deftest pilish-test-jsonl-duplicate-policy-preserves-nil-and-valid-ids ()
+  "Fail-closed duplicate detection ignores absent legacy ids.
+Repeated nil/empty ids remain visible but unaddressable beside one valid
+id; only repeated nonempty string ids make a session ambiguous."
+  (let* ((entries
+          [(:type "message" :id "" :timestamp "2026-01-01T00:00:00Z"
+            :message (:role "user" :content "legacy empty one"))
+           (:type "message" :timestamp "2026-01-01T00:00:01Z"
+            :message (:role "user" :content "legacy absent one"))
+           (:type "message" :id "valid" :timestamp "2026-01-01T00:00:02Z"
+            :message (:role "assistant" :content "addressable"))
+           (:type "message" :id "" :timestamp "2026-01-01T00:00:03Z"
+            :message (:role "user" :content "legacy empty two"))
+           (:type "message" :timestamp "2026-01-01T00:00:04Z"
+            :message (:role "user" :content "legacy absent two"))])
+         (built (pilish-jsonl-build-tree entries))
+         (projected (pilish-jsonl-project-tree
+                     (plist-get built :tree) (plist-get built :leafId)))
+         (empty-leaf (pilish-jsonl-project-tree
+                      (plist-get built :tree) ""))
+         (session (list :entries entries :leafId "")))
+    (should (= (length (plist-get built :tree)) 5))
+    (should (= (length (plist-get projected :tree)) 5))
+    (should (equal (mapcar (lambda (node) (plist-get node :id))
+                           (append (plist-get projected :tree) nil))
+                   '(nil nil "valid" nil nil)))
+    (should-not (plist-get projected :leafId))
+    (should-not (plist-get empty-leaf :leafId))
+    (should-not (pilish-jsonl-current-projected-id session))
+    (should-not (pilish-jsonl-navigation-target session ""))))
 
 ;;;; Deep chain
 
@@ -1563,13 +1786,44 @@ resolved-position truth table; earlier self targets are not."
                          "u1" nil 0 '(:role "user" :content "root"))))))
     (should-not (pilish-jsonl-navigation-target session "deadbeef"))))
 
+(ert-deftest pilish-test-jsonl-current-projected-id ()
+  "The current projected id skips only projection-away bookkeeping.
+A user followed by label/session-info/custom records remains the
+current projected entry.  Model and thinking changes are displayable
+projected entries, so the last of those remains current even when a
+browser filter later hides it."
+  (let ((bookkeeping
+         (pilish-test--jsonl-session-at
+          (list pilish-test--jsonl-header
+                (pilish-test--jsonl-msg
+                 "u1" nil 0 '(:role "user" :content "current"))
+                (pilish-test--jsonl-entry
+                 "label" "l1" "u1" 1 :targetId "u1" :label "tag")
+                (pilish-test--jsonl-entry
+                 "session_info" "s1" "l1" 2 :name "named")
+                (pilish-test--jsonl-entry
+                 "custom" "c1" "s1" 3 :customType "meta" :data '(:ok t)))))
+        (settings
+         (pilish-test--jsonl-session-at
+          (list pilish-test--jsonl-header
+                (pilish-test--jsonl-msg
+                 "u1" nil 0 '(:role "user" :content "prompt"))
+                (pilish-test--jsonl-entry
+                 "model_change" "m1" "u1" 1
+                 :provider "test" :modelId "model")
+                (pilish-test--jsonl-entry
+                 "thinking_level_change" "h1" "m1" 2
+                 :thinkingLevel "high")))))
+    (should (equal (pilish-jsonl-current-projected-id bookkeeping) "u1"))
+    (should (equal (pilish-jsonl-current-projected-id settings) "h1"))))
+
 (ert-deftest pilish-test-jsonl-navigation-target-current-position ()
-  ":current-p compares the RESOLVED positions: a trailing filtered
-leaf (label here) resolves up, so targeting the visible entry it sits
-on is current; a target on another branch is not; a file already
-rewound makes the same user message current again AND still prefills
-(re-edit the same prompt); and nil equals nil when an all-filtered
-chain resolves both sides to nothing."
+  ":current-p compares positively RESOLVED positions.
+A trailing filtered leaf (label here) resolves up, so targeting the
+visible entry it sits on is current; a target on another branch is not;
+a file already rewound makes the same user message current again AND
+still prefills (re-edit the same prompt).  Two unresolved nil positions
+are not proof of equality."
   ;; Trailing label child: targeting the entry it resolves to is current.
   (let ((session (pilish-test--jsonl-session-at
                   (list pilish-test--jsonl-header
@@ -1607,13 +1861,56 @@ chain resolves both sides to nothing."
     (should (equal (pilish-jsonl-navigation-target session "u2")
                    (list :leaf-id "u1" :prefill "try the other way"
                          :current-p t))))
-  ;; nil == nil: an all-filtered chain resolves both sides to nil.
+  ;; nil is unresolved, not a position: nil == nil cannot prove current.
   (let ((session (pilish-test--jsonl-session-at
                   (list pilish-test--jsonl-header
                         (pilish-test--jsonl-entry
                          "label" "l1" nil 0 :targetId "l1" :label "only")))))
     (should (equal (pilish-jsonl-navigation-target session "l1")
-                   (list :leaf-id "l1" :current-p t)))))
+                   (list :leaf-id "l1" :current-p nil)))))
+
+(ert-deftest pilish-test-jsonl-navigation-current-needs-proven-equality ()
+  "Ambiguous or unresolved positions cannot manufacture :current-p.
+A unique user target rewinds to a root bookkeeping parent that has no
+visible resolution, while the raw current leaf is a differing duplicate
+and therefore also unresolved.  These distinct nil resolutions must not
+compare current.  Conversely, a unique current leaf does not make a
+request whose target ancestry is ambiguous safe: that target fails
+closed instead of claiming equality."
+  ;; Astra's exact false-no-op shape: both resolvers return nil for
+  ;; different reasons, but the unique user target remains navigable.
+  (let* ((session
+          (pilish-test--jsonl-session-at
+           (list pilish-test--jsonl-header
+                 (pilish-test--jsonl-entry
+                  "custom" "meta" nil 0 :customType "root-meta")
+                 (pilish-test--jsonl-msg
+                  "u" "meta" 1 '(:role "user" :content "safe prompt"))
+                 (pilish-test--jsonl-msg
+                  "dup" nil 2 '(:role "assistant" :content "first"))
+                 (pilish-test--jsonl-msg
+                  "dup" nil 3 '(:role "assistant" :content "later")))))
+         (target (pilish-jsonl-navigation-target session "u")))
+    (should-not (pilish-jsonl-current-projected-id session))
+    (should (equal target
+                   (list :leaf-id "meta" :prefill "safe prompt"
+                         :current-p nil))))
+  ;; The current position is provably unique, but the selected user would
+  ;; rewind through a differing duplicate parent and must fail closed.
+  (let ((session
+         (pilish-test--jsonl-session-at
+          (list pilish-test--jsonl-header
+                (pilish-test--jsonl-entry
+                 "custom" "dup-parent" nil 0 :customType "first")
+                (pilish-test--jsonl-entry
+                 "custom" "dup-parent" nil 1 :customType "later")
+                (pilish-test--jsonl-msg
+                 "u" "dup-parent" 2 '(:role "user" :content "unsafe"))
+                (pilish-test--jsonl-msg
+                 "current" nil 3
+                 '(:role "assistant" :content "current"))))))
+    (should (equal (pilish-jsonl-current-projected-id session) "current"))
+    (should-not (pilish-jsonl-navigation-target session "u"))))
 
 (ert-deftest pilish-test-jsonl-navigation-lines-chain-to-end ()
   "navigation-lines reorders for a rewrite: the header line stays
