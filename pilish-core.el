@@ -669,6 +669,7 @@ containing EVENT, then clears this process's pending request tables."
 
 (defvar pilish-executable)  ; forward decl — core.el cannot require ui.el
 (defvar pilish-project-trust-policy) ; forward decl — defined in ui.el
+(declare-function pilish--executable "pilish-ui" (&optional directory))
 
 (defvar pilish-extra-args nil
   "Extra arguments to pass to the pi command.
@@ -691,8 +692,9 @@ This is useful for testing extensions or passing additional flags.")
       (_ (error "Invalid pilish-project-trust-policy: %S" policy)))))
 
 (defun pilish--pi-command ()
-  "Return the argv used to start Pi in RPC mode."
-  (append pilish-executable
+  "Return the argv used to start Pi in RPC mode.
+The program is resolved for `default-directory' by `pilish--executable'."
+  (append (pilish--executable default-directory)
           '("--mode" "rpc")
           pilish-extra-args
           (pilish--project-trust-args)))
