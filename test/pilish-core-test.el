@@ -1314,6 +1314,30 @@ and starting in DIRECTORY or `/tmp/'."
                             :command)
                  '("npx" "pi" "--mode" "rpc" "-e" "/path/to/ext.ts" "--approve"))))
 
+(ert-deftest pilish-test-start-process-executable-function-wins ()
+  "`pilish-executable-function' picks the command for the session directory."
+  (let* ((seen-dir nil)
+         (seen-default-directory nil)
+         (pilish-executable-function
+          (lambda (dir)
+            (setq seen-dir dir
+                  seen-default-directory default-directory)
+            '("pi-wrapped"))))
+    (should (equal (plist-get (pilish-test--capture-process-launch
+                               '("pi") nil 'default "/tmp/")
+                              :command)
+                   '("pi-wrapped" "--mode" "rpc")))
+    (should (equal seen-dir "/tmp/"))
+    (should (equal seen-default-directory "/tmp/"))))
+
+(ert-deftest pilish-test-start-process-executable-function-nil-falls-back ()
+  "A nil result from `pilish-executable-function' uses `pilish-executable'."
+  (let ((pilish-executable-function (lambda (_dir) nil)))
+    (should (equal (plist-get (pilish-test--capture-process-launch
+                               '("npx" "pi") nil 'default)
+                              :command)
+                   '("npx" "pi" "--mode" "rpc")))))
+
 (ert-deftest pilish-test-start-process-project-trust-default-omits-flag ()
   "A `default' project trust policy leaves Pi's own trust default in control."
   (should (equal (plist-get (pilish-test--capture-process-launch

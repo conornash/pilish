@@ -1837,6 +1837,18 @@ Buffer is read-only with `inhibit-read-only' used for insertion.
       (should (equal looked-up-command "npx"))
       (should (eq remote-flag t)))))
 
+(ert-deftest pilish-test-check-pi-uses-executable-function ()
+  "check-pi looks up the program chosen by `pilish-executable-function'."
+  (let ((pilish-executable '("pi"))
+        (pilish-executable-function (lambda (_dir) '("pi-wrapped")))
+        looked-up-command)
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (cmd &optional _remote)
+                 (setq looked-up-command cmd)
+                 (when (equal cmd "pi-wrapped") "/usr/local/bin/pi-wrapped"))))
+      (should (pilish--check-pi))
+      (should (equal looked-up-command "pi-wrapped")))))
+
 (ert-deftest pilish-test-check-pi-returns-nil-when-missing ()
   "check-pi returns nil when executable is not found."
   (let ((pilish-executable '("nonexistent-binary")))
