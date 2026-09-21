@@ -110,6 +110,29 @@ For npx users:
   :type '(repeat string)
   :group 'pilish)
 
+(defcustom pilish-executable-function nil
+  "Function choosing the pi command for a session directory, or nil.
+Called with one argument, the directory the session starts in, with
+`default-directory' bound to it.  Return a list of strings shaped like
+`pilish-executable', or nil to fall back to `pilish-executable'.
+
+Use this when the launcher depends on the project: a wrapper chosen from
+a marker file in the directory, for example.  The function runs before
+every process start and dependency check, so it should be cheap."
+  :type '(choice (const :tag "Always use pilish-executable" nil)
+                 function)
+  :group 'pilish)
+
+(defun pilish--executable (&optional directory)
+  "Return the pi command for DIRECTORY, as a list of strings.
+Consults `pilish-executable-function' first, then `pilish-executable'.
+DIRECTORY defaults to `default-directory'."
+  (let ((directory (or directory default-directory)))
+    (or (and pilish-executable-function
+             (let ((default-directory directory))
+               (funcall pilish-executable-function directory)))
+        pilish-executable)))
+
 (defcustom pilish-project-trust-policy 'approve
   "How to pass Pi project trust flags when starting RPC sessions.
 Pi does not show its built-in project trust prompt in RPC mode.  The
@@ -2356,7 +2379,7 @@ entries and re-prefix candidates; otherwise delegate to `executable-find'.
 Returns t if available, nil otherwise."
   (let* ((directory (pilish--dependency-directory directory))
          (default-directory directory)
-         (program (car pilish-executable))
+         (program (car (pilish--executable directory)))
          (remote-prefix (pilish--remote-prefix directory)))
     (and program
          (if (pilish--multi-hop-remote-prefix-p remote-prefix)
@@ -2371,7 +2394,7 @@ warnings for missing dependencies."
   (let ((directory (pilish--dependency-directory directory)))
     (unless (pilish--check-pi directory)
       (display-warning 'pi (format "%s not found in %s. Install with: %s"
-                                   (car pilish-executable)
+                                   (car (pilish--executable directory))
                                    (if-let* ((remote-prefix (pilish--remote-prefix directory)))
                                        (format "remote PATH (%s)" remote-prefix)
                                      "PATH")
@@ -2450,7 +2473,7 @@ buffers."
         (let* ((default-directory directory)
                (proc (make-process
                       :name "pi-version"
-                      :command `(,@pilish-executable "--version")
+                      :command `(,@(pilish--executable directory) "--version")
                       :connection-type 'pipe
                       :file-handler t
                       :buffer stdout-buf
