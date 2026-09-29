@@ -483,6 +483,9 @@ read-session-info, and navigation-lines all return nil."
                      "/tmp/pi-jsonl-test"))
       (should (= (length (plist-get session :entries)) 3))
       (should (equal (plist-get session :leafId) "u2")))
+    ;; The bounded probe uses that same first-nonblank rule.
+    (should (equal (plist-get (pilish-jsonl-read-session-header blank) :cwd)
+                   "/tmp/pi-jsonl-test"))
     ;; read-session-info: same header rule.
     (let ((info (pilish-jsonl-read-session-info blank)))
       (should info)
@@ -509,6 +512,7 @@ read-session-info, and navigation-lines all return nil."
       (insert "{not json at all\n" header-line "\n" u1-line "\n"))
     (should-not (pilish-jsonl-read-file junk))
     (should-not (pilish-jsonl-read-session-info junk))
+    (should-not (pilish-jsonl-read-session-header junk))
     ;; The leaf id exists in the would-be entries, so a nil here can
     ;; only come from the header rule.
     (should-not (pilish-jsonl-navigation-lines junk "u1"))))
@@ -543,6 +547,9 @@ reordering."
       (should (equal (plist-get (plist-get session :header) :cwd)
                      "/tmp/pi-jsonl-test"))
       (should (= (length (plist-get session :entries)) 2)))
+    ;; The bounded probe also decodes away the BOM.
+    (should (equal (plist-get (pilish-jsonl-read-session-header path) :cwd)
+                   "/tmp/pi-jsonl-test"))
     ;; read-session-info: same header rule.
     (should (equal (plist-get (pilish-jsonl-read-session-info path)
                               :messageCount)
@@ -1533,6 +1540,115 @@ the five-message parse budget).  label and custom entries are ignored."
                                     "%Y-%m-%dT%H:%M:%SZ" mtime t)
                          :messageCount 3
                          :firstMessage "hello world")))))
+
+(ert-deftest pilish-test-jsonl-read-session-header-prefix ()
+  "The header probe grows its byte prefix, never reading the history."
+  (let* ((dir (pilish-test--make-temp-directory "pi-jsonl-header-prefix"))
+         (short (expand-file-name "short.jsonl" dir))
+         (long (expand-file-name "long.jsonl" dir))
+         (blank (expand-file-name "blank.jsonl" dir))
+         (unterminated (expand-file-name "unterminated.jsonl" dir))
+         (invalid (expand-file-name "invalid.jsonl" dir))
+         (original (symbol-function 'insert-file-contents))
+         (reads nil))
+    (unwind-protect
+        (progn
+          (with-temp-file short
+            (insert (json-encode '(:type "session" :cwd "/tmp/a"))
+                    "\n" (make-string 10000 ?x)))
+          (with-temp-file long
+            (insert (json-encode
+                     (list :type "session" :cwd "/tmp/b"
+                           :id (make-string 4500 ?x))) "\n"
+                    (make-string 10000 ?x)))
+          (with-temp-file blank
+            (insert (make-string 4300 ?\s) "\n"
+                    (json-encode '(:type "session" :cwd "/tmp/c")) "\n"
+                    (make-string 10000 ?x)))
+          (with-temp-file unterminated
+            (insert (json-encode
+                     (list :type "session" :cwd "/tmp/d"
+                           :id (make-string 4500 ?x)))))
+          (with-temp-file invalid
+            (insert "not json\n"
+                    (json-encode '(:type "session" :cwd "/tmp/a")) "\n"))
+          (cl-letf (((symbol-function 'insert-file-contents)
+                     (lambda (path &rest args)
+                       (push (cons path args) reads)
+                       (apply original path args))))
+            (should (equal (plist-get (pilish-jsonl-read-session-header short)
+                                      :cwd)
+                           "/tmp/a"))
+            (should (equal reads (list (list short nil 0 4096))))
+            (setq reads nil)
+            (should (equal (plist-get (pilish-jsonl-read-session-header long)
+                                      :cwd)
+                           "/tmp/b"))
+            (should (equal (nreverse reads)
+                           (list (list long nil 0 4096)
+                                 (list long nil 0 8192))))
+            (setq reads nil)
+            (should (equal (plist-get (pilish-jsonl-read-session-header blank)
+                                      :cwd)
+                           "/tmp/c"))
+            (should (equal (nreverse reads)
+                           (list (list blank nil 0 4096)
+                                 (list blank nil 0 8192))))
+            (setq reads nil)
+            (should (equal (plist-get
+                            (pilish-jsonl-read-session-header unterminated)
+                            :cwd)
+                           "/tmp/d"))
+            (should (equal (nreverse reads)
+                           (list (list unterminated nil 0 4096)
+                                 (list unterminated nil 0
+                                       (file-attribute-size
+                                        (file-attributes unterminated))))))
+            (should-not (pilish-jsonl-read-session-header invalid))
+            (should-not (pilish-jsonl-read-session-header
+                         (expand-file-name "missing.jsonl" dir)))))
+      (delete-directory dir t))))
+
+(ert-deftest pilish-test-jsonl-read-session-header-long-utf8-bounded ()
+  "Probe complete UTF-8 headers without reading their large histories."
+  (let* ((dir (pilish-test--make-temp-directory "pi-jsonl-utf8-header-"))
+         (header (json-encode (list :type "session" :cwd "/tmp/utf8"
+                                    :id (make-string 1500 ?界))))
+         (original (symbol-function 'insert-file-contents)))
+    (unwind-protect
+        (progn
+          (should (> (string-bytes header) 4096))
+          (should (< (length header) 4096))
+          (dolist (leading-blanks '(nil t))
+            (let* ((path (expand-file-name
+                          (if leading-blanks "blank.jsonl" "header.jsonl")
+                          dir))
+                   (prefix (if leading-blanks
+                               (concat (make-string 4200 ?\s) "\n")
+                             ""))
+                   reads)
+              (with-temp-file path
+                (insert prefix header "\n" (make-string 200000 ?x)))
+              (should (equal (plist-get (pilish-jsonl-read-session-info path)
+                                            :cwd)
+                             "/tmp/utf8"))
+              (cl-letf (((symbol-function 'insert-file-contents)
+                         (lambda (file &rest args)
+                           (push (cons file args) reads)
+                           (apply original file args))))
+                (should (equal (plist-get (pilish-jsonl-read-session-header path)
+                                              :cwd)
+                               "/tmp/utf8")))
+              (should reads)
+              (should (cl-every (lambda (read)
+                                  (and (equal (car read) path)
+                                       (numberp (nth 3 read))
+                                       (<= (nth 3 read) 16384)
+                                       (< (nth 3 read)
+                                          (file-attribute-size
+                                           (file-attributes path)))))
+                                reads)))))
+      (delete-directory dir t))))
 
 (ert-deftest pilish-test-jsonl-read-session-info-keeps-name-before-malformed-tail ()
   "A malformed session_info tail does not clear the latest parseable name."

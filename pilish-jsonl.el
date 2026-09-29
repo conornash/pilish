@@ -292,6 +292,33 @@ check only."
                (equal (plist-get data :type) "session"))
       data)))
 
+(defun pilish-jsonl-read-session-header (path)
+  "Read PATH's first complete nonblank session header, or return nil.
+Grow the byte prefix only until that line is complete (or EOF), never
+reading a whole history merely because its header exceeds 4096 bytes.
+The first nonblank line follows `pilish-jsonl-read-file's validation."
+  (condition-case nil
+      (with-temp-buffer
+        (let ((limit 4096) size complete)
+          (while (not complete)
+            (erase-buffer)
+            (insert-file-contents path nil 0 limit)
+            (goto-char (point-min))
+            (while (and (not (eobp)) (looking-at-p "[ \t\r]*$"))
+              (forward-line 1))
+            (if (save-excursion (search-forward "\n" nil t))
+                (setq complete t)
+              ;; A decoded character count cannot establish whether a
+              ;; byte-limited UTF-8 read reached the end of the file.
+              (setq size (or size (file-attribute-size (file-attributes path))))
+              (if (< limit size)
+                  (setq limit (min size (* 2 limit)))
+                (setq complete t))))
+          (unless (eobp)
+            (pilish--jsonl-parse-session-header
+             (buffer-substring-no-properties (point) (line-end-position))))))
+    (error nil)))
+
 (defun pilish-jsonl-read-file (path)
   "Read the session file at PATH.
 Return a plist with :path, :header, :entries, :leafId, and :name, or

@@ -1487,6 +1487,8 @@ Loading render under cleared flags."
                          process-environment)))
               (cl-letf (((symbol-function 'pilish--session-list-directory)
                          (lambda (&optional _chat-buf) dir))
+                        ((symbol-function 'pilish--session-directory)
+                         (lambda () "/home/fake/a/"))
                         ((symbol-function 'run-at-time)
                          (lambda (_secs _repeat fn &rest args)
                            (apply fn args)))
@@ -1533,6 +1535,8 @@ and none are live here)."
                          process-environment)))
               (cl-letf (((symbol-function 'pilish--session-list-directory)
                          (lambda (&optional _chat-buf) dir))
+                        ((symbol-function 'pilish--session-directory)
+                         (lambda () "/home/fake/a/"))
                         ((symbol-function 'run-at-time)
                          (lambda (_secs _repeat fn &rest args)
                            (apply fn args))))
@@ -1630,6 +1634,8 @@ or discard the healthy files around it."
                          process-environment)))
               (cl-letf (((symbol-function 'pilish--session-list-directory)
                          (lambda (&optional _chat-buf) dir))
+                        ((symbol-function 'pilish--session-directory)
+                         (lambda () "/home/fake/a/"))
                         ((symbol-function 'run-at-time)
                          (lambda (_secs _repeat fn &rest args)
                            (apply fn args))))
@@ -5480,11 +5486,13 @@ and non-munged directories.  scope=current scans one directory."
             ;; The fork threads to its parent session file.
             (should (equal (plist-get fork-item :parentSessionPath) root-path))
             (should-not (plist-get fork-item :name))))
-        ;; scope=current scans exactly one directory: the menu-supplied
-        ;; session list directory.
+        ;; scope=current scans exactly one default project directory;
+        ;; align the browser's cwd with the fixture's munged directory.
         (setq calls nil)
         (cl-letf (((symbol-function 'pilish--session-list-directory)
                    (lambda (&optional _chat-buf) dir-a))
+                  ((symbol-function 'pilish--session-directory)
+                   (lambda () "/home/fake/a/"))
                   ((symbol-function 'run-at-time)
                    (lambda (_secs _repeat fn &rest args) (apply fn args))))
           (pilish--browse-load-sessions
@@ -5494,6 +5502,227 @@ and non-munged directories.  scope=current scans one directory."
           (should (equal (sort (mapcar (lambda (i) (plist-get i :path)) items)
                                #'string<)
                          (sort (list root-path fork-path) #'string<))))))))
+
+(ert-deftest pilish-test-scan-discovers-flat-custom-session-dir ()
+  "Custom sessionDir scans flat JSONL and scopes by the header cwd."
+  (let* ((sandbox (pilish-test--make-temp-directory "pi-flat-scan-"))
+         (dir (expand-file-name "custom-sessions" sandbox))
+         (project-a (expand-file-name "project-a" sandbox))
+         (project-b (expand-file-name "project-b" sandbox))
+         (path-a (expand-file-name "a.jsonl" dir))
+         (path-b (expand-file-name "b.jsonl" dir))
+         (broken (expand-file-name "broken.jsonl" dir))
+         (nested (expand-file-name "--old-project--" dir))
+         (open-session-info (symbol-function 'pilish-jsonl-open-session-info))
+         (opened nil)
+         (calls nil))
+    (make-directory dir t)
+    (make-directory project-a)
+    (make-directory project-b)
+    (make-directory nested)
+    (pilish-test--write-session-lines
+     path-a (list (json-encode (list :type "session" :version 3 :id "sid-a"
+                                     :timestamp pilish-test--browse-timestamp
+                                     :cwd project-a))
+                  (pilish-test--user-line "a1" nil "Project A")))
+    (pilish-test--write-session-lines
+     path-b (list (json-encode (list :type "session" :version 3 :id "sid-b"
+                                     :timestamp pilish-test--browse-timestamp
+                                     :cwd project-b))
+                  (pilish-test--user-line "b1" nil "Project B")))
+    (pilish-test--write-session-lines
+     broken (list (pilish-test--user-line "not-a-header" nil "decoy")))
+    (pilish-test--write-session-lines
+     (expand-file-name "old.jsonl" nested)
+     (list (json-encode (list :type "session" :version 3 :id "sid-old"
+                              :timestamp pilish-test--browse-timestamp
+                              :cwd project-a))))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (let ((default-directory (file-name-as-directory project-a)))
+        (should (equal (pilish--session-directory)
+                       (file-name-as-directory project-a)))
+        (cl-letf (((symbol-function 'pilish--session-list-directory)
+                   (lambda (&optional _chat-buf) dir))
+                  ((symbol-function 'pilish-jsonl-open-session-info)
+                   (lambda (path &optional search-text)
+                     (push path opened)
+                     (funcall open-session-info path search-text)))
+                  ((symbol-function 'run-at-time)
+                   (lambda (_secs _repeat fn &rest args) (apply fn args))))
+          (pilish--browse-load-sessions
+           'current (lambda (items error) (push (list items error) calls)))
+          (pcase-let ((`(,items ,error) (car calls)))
+            (should-not error)
+            (should (equal (mapcar (lambda (item) (plist-get item :path)) items)
+                           (list path-a)))
+            ;; Unrelated and invalid files need only a short header read.
+            (should (equal opened (list path-a))))
+          (setq calls nil opened nil)
+          (pilish--browse-load-sessions
+           'all (lambda (items error) (push (list items error) calls)))
+          (pcase-let ((`(,items ,error) (car calls)))
+            (should-not error)
+            (should (equal (sort (mapcar (lambda (item) (plist-get item :path))
+                                         items)
+                                 #'string<)
+                           (list path-a path-b)))))))))
+
+(ert-deftest pilish-test-flat-session-dir-with-munged-name ()
+  "A custom --archives-- directory is flat, regardless of its basename."
+  (let* ((sandbox (pilish-test--make-temp-directory "pi-flat-munged-"))
+         (flat (expand-file-name "--archives--" sandbox))
+         (project-a (expand-file-name "project-a" sandbox))
+         (project-b (expand-file-name "project-b" sandbox))
+         (path-a (expand-file-name "a.jsonl" flat))
+         (path-b (expand-file-name "b.jsonl" flat))
+         (chat (generate-new-buffer " *pilish-flat-munged-chat*"))
+         (original-open (symbol-function 'pilish-jsonl-open-session-info))
+         opened)
+    (unwind-protect
+        (progn
+          (make-directory flat)
+          (make-directory project-a)
+          (make-directory project-b)
+          (pilish-test--write-session-file path-a "Project A" project-a)
+          (pilish-test--write-session-file path-b "Project B" project-b)
+          (with-current-buffer chat
+            (setq default-directory (file-name-as-directory project-a)
+                  pilish--canonical-session-directory default-directory
+                  pilish--state (list :session-file path-a)))
+          (pilish-test--with-browse-link chat
+            (let ((default-directory (file-name-as-directory project-a))
+                  (process-environment
+                   (cons (format "PI_CODING_AGENT_DIR=%s"
+                                 (expand-file-name "agent" sandbox))
+                         process-environment)))
+              (should (equal (directory-file-name
+                              (pilish--session-list-directory)) flat))
+              (cl-letf (((symbol-function 'run-at-time)
+                         (lambda (_secs _repeat fn &rest args)
+                           (apply fn args)))
+                        ((symbol-function 'pilish-jsonl-open-session-info)
+                         (lambda (path &optional search-text)
+                           (push path opened)
+                           (funcall original-open path search-text))))
+                (dolist (case `((current ,(list path-a))
+                                (all ,(list path-a path-b))))
+                  (let (calls)
+                    (setq opened nil)
+                    (pilish--browse-load-sessions
+                     (car case)
+                     (lambda (items error) (push (list items error) calls)))
+                    (should (= (length calls) 1))
+                    (should-not (cadar calls))
+                    (should (equal (sort (mapcar (lambda (item)
+                                                   (plist-get item :path))
+                                                 (caar calls))
+                                         #'string<)
+                                   (cadr case)))
+                    ;; Even with this name, current must not open B's history.
+                    (when (eq (car case) 'current)
+                      (should (equal opened (list path-a))))))))))
+      (kill-buffer chat)
+      (delete-directory sandbox t))))
+
+(ert-deftest pilish-test-flat-session-current-uses-linked-git-subdirectory ()
+  "The linked chat's cwd, not its Git root, identifies current sessions."
+  (skip-unless (executable-find "git"))
+  (let* ((sandbox (pilish-test--make-temp-directory "pi-flat-git-"))
+         (flat (expand-file-name "custom-sessions" sandbox))
+         (project (expand-file-name "project" sandbox))
+         (nested (expand-file-name "nested" project))
+         (path-a (expand-file-name "a.jsonl" flat))
+         (path-b (expand-file-name "b.jsonl" flat))
+         (chat (generate-new-buffer " *pilish-flat-git-chat*"))
+         (original-open (symbol-function 'pilish-jsonl-open-session-info))
+         opened calls)
+    (unwind-protect
+        (progn
+          (make-directory flat)
+          (make-directory nested t)
+          (should (= (call-process "git" nil nil nil "-C" project "init" "-q") 0))
+          (pilish-test--write-session-file path-a "Nested work" nested)
+          ;; A separate pi cwd inside the same Git project is not current.
+          (pilish-test--write-session-file path-b "Root work" project)
+          (with-current-buffer chat
+            (setq default-directory (file-name-as-directory nested)
+                  pilish--canonical-session-directory default-directory
+                  pilish--state (list :session-file path-a)))
+          (pilish-test--with-browse-link chat
+            (let ((default-directory (file-name-as-directory nested))
+                  (process-environment
+                   (cons (format "PI_CODING_AGENT_DIR=%s"
+                                 (expand-file-name "agent" sandbox))
+                         process-environment)))
+              (should (equal (directory-file-name
+                              (expand-file-name
+                               (project-root (project-current))))
+                             project))
+              (should (equal (directory-file-name
+                              (pilish--session-list-directory)) flat))
+              (cl-letf (((symbol-function 'run-at-time)
+                         (lambda (_secs _repeat fn &rest args)
+                           (apply fn args)))
+                        ((symbol-function 'pilish-jsonl-open-session-info)
+                         (lambda (path &optional search-text)
+                           (push path opened)
+                           (funcall original-open path search-text))))
+                (pilish--browse-load-sessions
+                 'current (lambda (items error)
+                            (push (list items error) calls)))
+                (should (= (length calls) 1))
+                (should-not (cadar calls))
+                (should (equal (mapcar (lambda (item) (plist-get item :path))
+                                       (caar calls))
+                               (list path-a)))
+                (should (equal opened (list path-a)))))))
+      (kill-buffer chat)
+      (delete-directory sandbox t))))
+
+(ert-deftest pilish-test-flat-session-current-keeps-remote-route ()
+  "Flat current scopes keep single-hop and multi-hop TRAMP identities."
+  (dolist (route '("/ssh:target:" "/ssh:jump|ssh:target:"))
+    (let* ((chat (generate-new-buffer " *pilish-flat-remote-chat*"))
+           (dir (concat route "/flat/"))
+           (path-a (concat dir "a.jsonl"))
+           (path-b (concat dir "b.jsonl"))
+           opened calls)
+      (unwind-protect
+          (progn
+            (with-current-buffer chat
+              (setq pilish--canonical-session-directory (concat route "/work/")
+                    pilish--state (list :session-file path-a)))
+            (pilish-test--with-browse-link chat
+              ;; Keep filesystem IO synthetic, but use real TRAMP path
+              ;; operations and real project identity/filtering code.
+              (cl-letf (((symbol-function 'pilish--browse-session-files)
+                         (lambda (dirs &rest _)
+                           (should (equal dirs (list dir)))
+                           (list path-a path-b)))
+                        ((symbol-function 'pilish-jsonl-read-session-header)
+                         (lambda (path)
+                           (list :type "session" :cwd
+                                 (if (equal path path-a) "/work" "/other"))))
+                        ((symbol-function 'pilish-jsonl-open-session-info)
+                         (lambda (path &rest _) (push path opened) path))
+                        ((symbol-function 'pilish-jsonl-step-session-info)
+                         (lambda (path &rest _)
+                           (cons 'done (list :path path :cwd "/work"))))
+                        ((symbol-function 'pilish-jsonl-close-session-info)
+                         #'ignore)
+                        ((symbol-function 'run-at-time)
+                         (lambda (_secs _repeat fn &rest args)
+                           (apply fn args))))
+                (pilish--browse-load-sessions
+                 'current (lambda (items error) (push (list items error) calls)))))
+            (should (= (length calls) 1))
+            (should-not (cadar calls))
+            (should (equal (mapcar (lambda (item) (plist-get item :path))
+                                   (caar calls))
+                           (list path-a)))
+            (should (equal opened (list path-a))))
+        (kill-buffer chat)))))
 
 (ert-deftest pilish-test-load-sessions-chunked ()
   "--browse-load-sessions chunks long scans and reports once.
@@ -5772,6 +6001,94 @@ and no stale callback or continuation timer is emitted."
         (should (equal closed '("/scan/one.jsonl")))
         (should-not callbacks)
         (should-not timers)))))
+
+(ert-deftest pilish-test-flat-session-setup-failure-clears-loading ()
+  "Project lookup failures finish a flat scan instead of leaving it loading."
+  (dolist (failure '(quit error))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (cl-letf (((symbol-function 'pilish--browse-current-session-directory)
+                 (lambda () "/flat/"))
+                ((symbol-function 'pilish--browse-session-files) #'ignore)
+                ((symbol-function 'pilish--browse-project-directory)
+                 (lambda () (signal failure '("broken cwd")))))
+        (condition-case nil
+            (pilish--session-browser-fetch-and-render)
+          ((error quit) nil)))
+      (should-not pilish--session-browser-loading)
+      (should (equal pilish--session-browser-error
+                     (if (eq failure 'quit)
+                         "Session scan was interrupted"
+                       "Cannot list sessions: broken cwd"))))))
+
+(ert-deftest pilish-test-flat-session-setup-cancellation ()
+  "Cancellation during scan setup stops before the next IO boundary."
+  (dolist (phase '(resolve classify project files))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (let (cancelled after-cancellation callbacks timers)
+        (cl-labels ((observe (stage)
+                      (when cancelled (push stage after-cancellation))
+                      (when (eq stage phase)
+                        (setq cancelled t)
+                        (cl-incf pilish--session-browser-fetch-token))))
+          (cl-letf (((symbol-function 'pilish--browse-session-directories)
+                     (lambda (&rest _) (observe 'resolve) '("/flat/")))
+                    ((symbol-function 'pilish--browse-flat-session-directory-p)
+                     (lambda (_) (observe 'classify) t))
+                    ((symbol-function 'pilish--browse-project-directory)
+                     (lambda () "/work/"))
+                    ((symbol-function 'pilish--session-canonical-project-spec)
+                     (lambda (_) (observe 'project) '("/work" nil ("work"))))
+                    ((symbol-function 'pilish--browse-session-files)
+                     (lambda (&rest _) (observe 'files) '("/flat/a.jsonl")))
+                    ((symbol-function 'run-at-time)
+                     (lambda (&rest args) (push args timers))))
+            (pilish--browse-load-sessions
+             'current (lambda (&rest args) (push args callbacks)))))
+        (should cancelled)
+        (should-not after-cancellation)
+        (should-not callbacks)
+        (should-not timers)))))
+
+(ert-deftest pilish-test-session-directories-cancel-during-classification ()
+  "All-projects classification cannot return stale paths or enter root IO."
+  (dolist (flat '(nil t))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (setq pilish--session-browser-fetch-token 1)
+      (let (root-io)
+        (cl-letf (((symbol-function 'pilish--browse-current-session-directory)
+                   (lambda () "/flat/"))
+                  ((symbol-function 'pilish--browse-flat-session-directory-p)
+                   (lambda (_dir)
+                     (cl-incf pilish--session-browser-fetch-token)
+                     flat))
+                  ((symbol-function 'pilish-jsonl-sessions-root)
+                   (lambda (&rest _) (push t root-io) "/sessions/")))
+          (should-not (pilish--browse-session-directories
+                       'all (current-buffer) 1)))
+        (should-not root-io)))))
+
+(ert-deftest pilish-test-flat-session-prefilter-cancellation ()
+  "A superseded header probe never opens the file or reports results."
+  (with-temp-buffer
+    (pilish-session-browser-mode)
+    (setq pilish--session-browser-fetch-token 1)
+    (let (opened callbacks timers)
+      (cl-letf (((symbol-function 'pilish-jsonl-open-session-info)
+                 (lambda (&rest args) (push args opened)))
+                ((symbol-function 'run-at-time)
+                 (lambda (&rest args) (push args timers))))
+        (pilish--browse-scan-session-files
+         (current-buffer) 1 '("/scan/one.jsonl" "/scan/two.jsonl") nil
+         (lambda (&rest args) (push args callbacks)) nil
+         (lambda (_file)
+           (cl-incf pilish--session-browser-fetch-token)
+           t)))
+      (should-not opened)
+      (should-not callbacks)
+      (should-not timers))))
 
 (ert-deftest pilish-test-load-sessions-interrupted-by-quit ()
   "A quit during a scan slice reports an error state, not a stuck

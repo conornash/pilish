@@ -4224,9 +4224,31 @@ all.  Signals when resolution itself fails."
       (pilish-jsonl-session-dir-for-cwd
        (pilish--session-directory))))
 
+(defun pilish--browse-project-directory ()
+  "Return the linked chat's stable cwd, or the browser's project directory."
+  (if (buffer-live-p pilish--chat-buffer)
+      (pilish--route-preserving-expand-file-name
+       (pilish--chat-session-directory pilish--chat-buffer))
+    (pilish--session-directory)))
+
+(defun pilish--browse-flat-session-directory-p (dir)
+  "Return non-nil when DIR is a flat custom session directory.
+Local default storage has one exact path for the linked chat's cwd;
+a custom sessionDir may have any name.  Remote storage still uses the
+munged-name heuristic because its configured sessions root is unknown."
+  (if (file-remote-p dir)
+      (not (string-match-p "\\`--.*--\\'"
+                           (file-name-nondirectory (directory-file-name dir))))
+    (not (equal (directory-file-name (expand-file-name dir))
+                (directory-file-name
+                 (expand-file-name
+                  (pilish-jsonl-session-dir-for-cwd
+                   (pilish--browse-project-directory))))))))
+
 (defun pilish--browse-session-directories (scope &optional buf token)
   "Return the session directories for SCOPE while BUF owns TOKEN.
-`current' resolves one project directory.  `all' lists root-level
+`current' resolves the session file's directory.  For flat custom
+storage, `all' scans that same directory; otherwise it lists root-level
 munged --…-- directories under the sessions root, excluding sidecars
 and non-munged directories.  Missing roots read as empty; resolution
 errors signal as before.  BUF and TOKEN are optional for direct callers;
@@ -4236,33 +4258,34 @@ handler-dispatching directory operation."
          (lambda ()
            (or (null token)
                (pilish--session-browser-generation-current-p buf token)))))
-    (if (not (eq scope 'all))
-        (when (funcall current-p)
-          (let ((dir (pilish--browse-current-session-directory)))
-            (and (funcall current-p) (list dir))))
-      (when (funcall current-p)
-        (let ((cur (pilish--browse-current-session-directory)))
-          (when (funcall current-p)
-            (let ((root (if cur
-                            (pilish-jsonl-sessions-root
-                             (file-name-as-directory cur))
-                          (pilish-jsonl-sessions-root))))
-              ;; Root construction can itself dispatch a handler; never
-              ;; enter the root listing after it supersedes this token.
-              (when (funcall current-p)
-                (let ((candidates
-                       (condition-case nil
-                           (directory-files root t "\\`--")
-                         (error nil)))
-                      (result nil))
-                  (when (funcall current-p)
-                    (catch 'stale
-                      (dolist (dir candidates)
+    (when (funcall current-p)
+      (let ((cur (pilish--browse-current-session-directory)))
+        (cond
+         ((not (funcall current-p)))
+         ((or (not (eq scope 'all))
+              (and cur (pilish--browse-flat-session-directory-p cur)))
+          (and (funcall current-p) (list cur)))
+         ((funcall current-p)
+          (let ((root (if cur
+                          (pilish-jsonl-sessions-root
+                           (file-name-as-directory cur))
+                        (pilish-jsonl-sessions-root))))
+            ;; Root construction can itself dispatch a handler; never
+            ;; enter the root listing after it supersedes this token.
+            (when (funcall current-p)
+              (let ((candidates
+                     (condition-case nil
+                         (directory-files root t "\\`--")
+                       (error nil)))
+                    (result nil))
+                (when (funcall current-p)
+                  (catch 'stale
+                    (dolist (dir candidates)
+                      (unless (funcall current-p) (throw 'stale nil))
+                      (let ((directory-p (file-directory-p dir)))
                         (unless (funcall current-p) (throw 'stale nil))
-                        (let ((directory-p (file-directory-p dir)))
-                          (unless (funcall current-p) (throw 'stale nil))
-                          (when directory-p (push dir result))))
-                      (nreverse result))))))))))))
+                        (when directory-p (push dir result))))
+                    (nreverse result))))))))))))
 
 (defun pilish--browse-session-files (dirs &optional buf token)
   "Return every \\.jsonl file directly inside DIRS, in listing order.
@@ -4292,9 +4315,10 @@ later directory listings and returns nil."
   (pilish--session-browser-generation-current-p buf token))
 
 (defun pilish--browse-scan-session-files
-    (buf token files items callback &optional state)
+    (buf token files items callback &optional state include-file)
   "Advance FILES and accumulated ITEMS for BUF's generation TOKEN.
-STATE is the optional in-progress JSONL scan for the first file.  Each
+STATE is the optional in-progress JSONL scan for the first file.
+INCLUDE-FILE, when non-nil, tests each file before its full scan.  Each
 slice shares a 10 ms deadline across opens and line processing.  A
 positive-delay continuation allows a command-loop turn; it is not a
 latency guarantee.  Whole-file IO, individual records, joining, GC, and
@@ -4302,11 +4326,11 @@ final synchronous filtering/rendering can exceed the budget.
 
 At most one file state is retained by a pending continuation.  Ownership
 is checked before and immediately after every callback-capable open,
-read, and enrichment operation, and before the next file.  Cancellation
-observed in a running slice closes the current state during unwind,
-then touches no remaining file, schedules no continuation, and invokes
-no callback.  Completion, errors,
-and quit likewise close resources before CALLBACK receives (ITEMS ERROR).
+read, and enrichment operation, including INCLUDE-FILE, and before the
+next file.  Cancellation observed in a running slice closes the current
+state during unwind, then touches no remaining file, schedules no
+continuation, and invokes no callback.  Completion, errors, and quit
+likewise close resources before CALLBACK receives (ITEMS ERROR).
 Hiding the browser with q does not cancel a current generation."
   (let (transferred finished failure cancelled)
     (unwind-protect
@@ -4323,15 +4347,22 @@ Hiding the browser with q does not cancel a current generation."
                     (condition-case nil
                         (progn
                           (unless state
-                            (if (pilish--browse-session-scan-current-p
-                                 buf token)
+                            (let ((include
+                                   (or (null include-file)
+                                       (and (pilish--browse-session-scan-current-p
+                                             buf token)
+                                            (funcall include-file
+                                                     (car files))))))
+                              (unless (pilish--browse-session-scan-current-p
+                                       buf token)
+                                (setq cancelled t))
+                              (when (and include (not cancelled))
                                 (setq state
                                       (pilish-jsonl-open-session-info
                                        (car files) t))
-                              (setq cancelled t))
-                            (unless (pilish--browse-session-scan-current-p
-                                     buf token)
-                              (setq cancelled t)))
+                                (unless (pilish--browse-session-scan-current-p
+                                         buf token)
+                                  (setq cancelled t)))))
                           (when (and state (not cancelled))
                             (if (pilish--browse-session-scan-current-p
                                  buf token)
@@ -4384,7 +4415,8 @@ Hiding the browser with q does not cancel a current generation."
                       (progn
                         (run-at-time 0.001 nil
                                      #'pilish--browse-scan-session-files
-                                     buf token files items callback state)
+                                     buf token files items callback state
+                                     include-file)
                         (setq transferred t))
                     (setq finished t))))
             (quit (setq failure "Session scan was interrupted"))
@@ -4408,15 +4440,17 @@ scan with `:canonicalPath', `:canonicalProjectSpec', and, for forks,
 downstream renders need no archive-sized or remote canonicalization —
 only the few live-process session paths canonicalize locally per
 render.  ERROR is an error
-string or nil.  SCOPE is `current' (one project directory) or `all'
-\(every munged directory under the sessions root).  The scan is
+string or nil.  SCOPE is `current' (one project directory or the
+current project's sessions in flat custom storage) or `all' (every
+munged directory under the default sessions root, or the flat custom
+directory).  The scan is
 chunked (see `pilish--browse-scan-session-files') and shows a loading
 state throughout.  A request that remains current reports exactly
 once; a superseded request stops at the next guarded directory/file
-boundary and is dropped without a callback.  Directory resolution
-failures surface synchronously as the ERROR string \"Cannot list
-sessions: …\", but only while that request still owns its generation;
-a resolver that reentrantly starts another fetch cannot publish its
+boundary and is dropped without a callback.  Scope setup failures
+surface synchronously as \"Cannot list sessions: …\", or \"Session scan
+was interrupted\" for quit, only while the request owns its generation.
+A resolver that reentrantly starts another fetch cannot publish its
 now-stale failure.  GENERATION, when supplied by the browser fetch
 cycle, was claimed before its loading render so render-time reentrancy
 cannot reverse request order.  Direct seam callers omit it and claim a
@@ -4429,26 +4463,57 @@ new generation here."
     ;; A fetch can be superseded before it even reaches this seam when
     ;; its loading render reenters Lisp.  Do no directory IO in that case.
     (when (pilish--browse-session-scan-current-p buf token)
-      (let ((dirs nil)
-            (failure nil))
+      (let (dirs files flat-current project-id failure)
+        ;; Resolve the scope and its identity under the same ownership and
+        ;; error boundary as directory IO.  Capture the identity before
+        ;; scheduling slices, which may run in an unrelated buffer.
         (condition-case err
-            (setq dirs (pilish--browse-session-directories
-                        scope buf token))
+            (progn
+              (setq dirs (pilish--browse-session-directories scope buf token))
+              (when (and (pilish--browse-session-scan-current-p buf token)
+                         (eq scope 'current) (car dirs))
+                (setq flat-current
+                      (pilish--browse-flat-session-directory-p (car dirs))))
+              (when (and flat-current
+                         (pilish--browse-session-scan-current-p buf token))
+                (setq project-id
+                      (car (pilish--session-canonical-project-spec
+                            (list :cwd (pilish--browse-project-directory)
+                                  :path (car dirs))))))
+              (when (pilish--browse-session-scan-current-p buf token)
+                (setq files (pilish--browse-session-files dirs buf token))))
+          (quit (setq failure "Session scan was interrupted"))
           (error
            (setq failure (format "Cannot list sessions: %s"
                                  (error-message-string err)))))
-        ;; Directory/file handlers can reenter and start a newer fetch.
-        ;; Check after each synchronous boundary before doing more IO or
-        ;; publishing/scheduling anything for this generation.
         (cond
          ((not (pilish--browse-session-scan-current-p buf token)))
          (failure
           (funcall callback nil failure))
          (t
-          (let ((files (pilish--browse-session-files dirs buf token)))
-            (when (pilish--browse-session-scan-current-p buf token)
-              (run-at-time 0 nil #'pilish--browse-scan-session-files
-                           buf token files nil callback)))))))))
+          (run-at-time
+           0 nil #'pilish--browse-scan-session-files buf token files nil
+           (if flat-current
+               (lambda (items error)
+                 (funcall callback
+                          (cl-remove-if-not
+                           (lambda (item)
+                             (and project-id
+                                  (equal project-id
+                                         (car (pilish--session-project-spec
+                                               item)))))
+                           items)
+                          error))
+             callback)
+           nil
+           (when flat-current
+             (lambda (file)
+               (when-let* ((header (pilish-jsonl-read-session-header file))
+                           (cwd (plist-get header :cwd)))
+                 (and project-id
+                      (equal project-id
+                             (car (pilish--session-canonical-project-spec
+                                   (list :path file :cwd cwd)))))))))))))))
 
 (defun pilish--tree-browser-chat-session-file ()
   "Return the linked chat buffer's current session file, or nil.
