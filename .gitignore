@@ -20,3 +20,6 @@ tmp/
 # Local pi prompts and config
 .pi/
 .deps-stamp
+
+# Local worktrees
+.worktrees/
