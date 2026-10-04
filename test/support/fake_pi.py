@@ -13,7 +13,7 @@ Manual usage examples:
     ./test/support/fake_pi.py --scenario extension-confirm \
         --extension-timeout-ms 10000 --log-file /tmp/fake-pi.log
 
-Scenario files live in ``test/fixtures/fake-pi/`` and currently support four
+Scenario files live in ``test/fixtures/fake-pi/`` and currently support five
 prompt behaviors:
 
 ``text_stream``
@@ -33,6 +33,10 @@ prompt behaviors:
 ``tool_stream``
     Emits the streamed tool-call and tool-execution event surface, then ends
     with optional assistant text.
+
+``nested_tools``
+    Replays one literal nested-tool wire flow, including a parent result
+    snapshot and a child end after settlement.  It executes no tools or scripts.
 """
 
 from __future__ import annotations
@@ -63,24 +67,15 @@ class SlashCommand:
     name: str
     source: Literal["extension", "prompt", "skill"]
     description: str | None = None
-    path: str | None = None
-    location: str | None = None
+    source_info: JsonDict | None = None
 
     def to_rpc(self) -> JsonDict:
-        """Return this command in RPC response shape.
-
-        Emits ``sourceInfo`` with ``scope`` and ``path`` sub-fields.
-        """
+        """Return this command with its literal discovery metadata."""
         data: JsonDict = {"name": self.name, "source": self.source}
         if self.description is not None:
             data["description"] = self.description
-        if self.path is not None or self.location is not None:
-            source_info: JsonDict = {}
-            if self.location is not None:
-                source_info["scope"] = self.location
-            if self.path is not None:
-                source_info["path"] = self.path
-            data["sourceInfo"] = source_info
+        if self.source_info is not None:
+            data["sourceInfo"] = self.source_info
         return data
 
 
@@ -106,6 +101,7 @@ class TextStreamPrompt:
     delay_ms: int = 30
     echo_user: bool = True
     steer_assistant_text: str | None = None
+    handled_input: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,8 +143,20 @@ class ToolStreamPrompt:
     echo_user: bool = True
 
 
+@dataclass(frozen=True)
+class NestedToolPrompt:
+    """Scenario data for one literal nested-tool wire replay."""
+
+    type: Literal["nested_tools"]
+    records: tuple[JsonDict, ...]
+
+
 PromptBehavior = (
-    TextStreamPrompt | ExtensionDialogPrompt | CustomMessagePrompt | ToolStreamPrompt
+    TextStreamPrompt
+    | ExtensionDialogPrompt
+    | CustomMessagePrompt
+    | ToolStreamPrompt
+    | NestedToolPrompt
 )
 
 
@@ -238,14 +246,12 @@ def load_scenario(path: Path, name: str) -> Scenario:
     data = json.loads(path.read_text(encoding="utf-8"))
     commands = []
     for item in data.get("commands", []):
-        si = item.get("sourceInfo", {})
         commands.append(
             SlashCommand(
                 name=item["name"],
                 source=item["source"],
                 description=item.get("description"),
-                path=si.get("path"),
-                location=si.get("scope"),
+                source_info=item.get("sourceInfo"),
             )
         )
     prompt_data = data["prompt"]
@@ -258,6 +264,7 @@ def load_scenario(path: Path, name: str) -> Scenario:
             delay_ms=int(prompt_data.get("delay_ms", 30)),
             echo_user=bool(prompt_data.get("echo_user", True)),
             steer_assistant_text=prompt_data.get("steer_assistant_text"),
+            handled_input=prompt_data.get("handled_input"),
         )
     elif prompt_type == "extension_dialog":
         prompt = ExtensionDialogPrompt(
@@ -292,6 +299,10 @@ def load_scenario(path: Path, name: str) -> Scenario:
             assistant_text=prompt_data.get("assistant_text", ""),
             delay_ms=int(prompt_data.get("delay_ms", 30)),
             echo_user=bool(prompt_data.get("echo_user", True)),
+        )
+    elif prompt_type == "nested_tools":
+        prompt = NestedToolPrompt(
+            type="nested_tools", records=tuple(prompt_data["records"])
         )
     else:
         raise ValueError(f"Unsupported prompt type: {prompt_type}")
@@ -449,10 +460,7 @@ class FakePiHarness:
         return tuple(images)
 
     def _handle_prompt(self, command: JsonDict) -> None:
-        """Validate and start the scenario-specific prompt behavior."""
-        if self.state.is_streaming:
-            self._fail(command, "Fake pi is already streaming")
-            return
+        """Validate input and report its scenario-specific disposition."""
         try:
             prompt_images = self._parse_prompt_images(command)
         except ValueError as exc:
@@ -467,11 +475,39 @@ class FakePiHarness:
                 "Prompt images are not supported by extension-owned fake scenarios",
             )
             return
-        self._abort_requested.clear()
         message = str(command["message"])
+        if isinstance(behavior, TextStreamPrompt) and message == behavior.handled_input:
+            self._respond(command, data={"disposition": "handled"})
+            return
+        if self.state.is_streaming:
+            streaming_behavior = command.get("streamingBehavior")
+            if streaming_behavior is None:
+                self._fail(
+                    command,
+                    "Fake pi is already streaming; specify streamingBehavior to queue input",
+                )
+            elif streaming_behavior != "steer":
+                self._fail(
+                    command,
+                    f"streamingBehavior {streaming_behavior!r} is out of scope for this fake",
+                )
+            elif prompt_images:
+                self._fail(command, "Steering images are out of scope for this fake")
+            else:
+                self._queue_steer(command)
+            return
+        if (
+            isinstance(behavior, (ExtensionDialogPrompt, NestedToolPrompt))
+            and self._run_thread is not None
+        ):
+            self._fail(
+                command, "This fake supports only one active dialog or replay worker"
+            )
+            return
+        self._abort_requested.clear()
         match behavior:
             case TextStreamPrompt() as behavior:
-                self._respond(command)
+                self._respond(command, data={"disposition": "started"})
                 self._start_run(
                     name=f"fake-pi-text-stream-{self.scenario.name}",
                     target=lambda: self._run_text_prompt(
@@ -487,12 +523,12 @@ class FakePiHarness:
                         f"Scenario {self.scenario.name} only supports {behavior.command_name}",
                     )
                     return
-                self._respond(command)
                 self._start_run(
                     name=f"fake-pi-dialog-{self.scenario.name}",
                     target=lambda: self._run_extension_dialog(
-                        message, cast(ExtensionDialogPrompt, behavior)
+                        command, cast(ExtensionDialogPrompt, behavior)
                     ),
+                    streaming=False,
                 )
             case CustomMessagePrompt() as behavior:
                 if message != behavior.command_name:
@@ -501,15 +537,22 @@ class FakePiHarness:
                         f"Scenario {self.scenario.name} only supports {behavior.command_name}",
                     )
                     return
-                self._respond(command)
                 self._run_custom_message_prompt(message, behavior)
+                self._respond(command, data={"disposition": "handled"})
             case ToolStreamPrompt() as behavior:
-                self._respond(command)
+                self._respond(command, data={"disposition": "started"})
                 self._start_run(
                     name=f"fake-pi-tool-stream-{self.scenario.name}",
                     target=lambda: self._run_tool_prompt(
                         message, behavior, prompt_images=prompt_images
                     ),
+                )
+            case NestedToolPrompt() as behavior:
+                user_message = self._build_user_message(message, prompt_images)
+                self._respond(command, data={"disposition": "started"})
+                self._start_run(
+                    name=f"fake-pi-nested-tools-{self.scenario.name}",
+                    target=lambda: self._run_nested_tool_prompt(user_message, behavior),
                 )
             case _:
                 raise AssertionError("Unknown prompt behavior")
@@ -519,14 +562,27 @@ class FakePiHarness:
         if "images" in command:
             self._fail(command, "Steering images are out of scope for this fake")
             return
+        behavior = self.scenario.prompt
+        if (
+            isinstance(behavior, TextStreamPrompt)
+            and str(command["message"]) == behavior.handled_input
+        ):
+            self._respond(command, data={"disposition": "handled"})
+            return
         if not self.state.is_streaming:
             self._fail(command, "Cannot steer when no prompt is streaming")
             return
+        self._queue_steer(command)
+
+    def _queue_steer(self, command: JsonDict) -> None:
+        """Accept text into the scenario's single pending steering slot."""
         if not isinstance(self.scenario.prompt, TextStreamPrompt):
             self._fail(command, "Current fake scenario does not support steer")
             return
-        self._pending_steer_message = str(command["message"])
-        self._respond(command)
+        with self._session_lock:
+            self._pending_steer_message = str(command["message"])
+            self.state.pending_message_count = 1
+        self._respond(command, data={"disposition": "queued"})
 
     def _handle_new_session(self, command: JsonDict) -> None:
         """Reset the fake to a fresh session."""
@@ -601,7 +657,7 @@ class FakePiHarness:
         self._respond(command, data={"cancelled": False})
 
     def _handle_set_session_name(self, command: JsonDict) -> None:
-        """Persist a session name to the real session file."""
+        """Append a name, buffering it until the first conversation message."""
         if not isinstance(raw_name := command.get("name"), str):
             self._fail(command, "Session name must be a string")
             return
@@ -730,17 +786,14 @@ class FakePiHarness:
 
     def _run_extension_dialog(
         self,
-        command_text: str,
+        command: JsonDict,
         behavior: ExtensionDialogPrompt,
     ) -> None:
-        """Run an extension dialog scenario until it resolves or times out."""
-        self._persist_user_message(self._build_user_message(command_text))
-        self._write_json({"type": "agent_start"})
+        """Resolve a dialog and emit its custom output before handled acceptance."""
         request_id = f"ext-{uuid.uuid4().hex[:8]}"
         request = self._build_extension_request(request_id, behavior)
-        self._write_json(request)
         response = self._wait_for_extension_response(
-            request_id, self._dialog_timeout_ms(behavior)
+            request, self._dialog_timeout_ms(behavior)
         )
         result_key = self._dialog_result_key(behavior.method, response)
         message_text = behavior.response_messages.get(
@@ -751,7 +804,7 @@ class FakePiHarness:
         self._persist_custom_message(followup)
         self._write_json({"type": "message_start", "message": followup})
         self._write_json({"type": "message_end", "message": followup})
-        self._finish_run([followup])
+        self._respond(command, data={"disposition": "handled"})
 
     def _run_custom_message_prompt(
         self,
@@ -759,7 +812,6 @@ class FakePiHarness:
         behavior: CustomMessagePrompt,
     ) -> None:
         """Run a slash command that may emit one visible custom message."""
-        self._persist_user_message(self._build_user_message(command_text))
         if not behavior.message_text:
             return
         followup = self._build_custom_message(
@@ -800,6 +852,7 @@ class FakePiHarness:
             "api": self.state.model["api"],
             "provider": self.state.model["provider"],
             "model": self.state.model["id"],
+            "thinkingLevel": self.state.thinking_level,
             "usage": self._zero_usage(),
             "timestamp": now_ms(),
             "stopReason": "toolUse",
@@ -916,6 +969,40 @@ class FakePiHarness:
             [user_message, tool_assistant_message, tool_result_message, final_message]
         )
 
+    def _run_nested_tool_prompt(
+        self, user_message: JsonDict, behavior: NestedToolPrompt
+    ) -> None:
+        """Replay literal wire records, persisting only authoritative messages."""
+        self._write_json({"type": "agent_start"})
+        self._persist_user_message(user_message)
+        self._write_json({"type": "message_start", "message": user_message})
+        self._write_json({"type": "message_end", "message": user_message})
+        loop_ended = False
+        for record in behavior.records:
+            if not self._sleep_ms(30, abortable=True):
+                if self.state.is_streaming:
+                    if loop_ended:
+                        self._settle_run()
+                    else:
+                        self._finish_aborted_run()
+                return
+            record_type = record["type"]
+            if record_type == "message_end":
+                message = record["message"]
+                if message["role"] == "assistant":
+                    self._persist_assistant_message(message)
+                elif message["role"] == "toolResult":
+                    self._persist_tool_result_message(message)
+            elif record_type == "agent_end":
+                loop_ended = True
+            elif record_type == "agent_settled":
+                self.state.is_streaming = False
+            self._write_json(record)
+            # Settlement ends streaming, not this worker.  Leave a fixed pause
+            # to observe the saved snapshot or join playback before its late end.
+            if record_type == "agent_settled" and not self._sleep_ms(500, abortable=True):
+                return
+
     def _build_extension_request(
         self, request_id: str, behavior: ExtensionDialogPrompt
     ) -> JsonDict:
@@ -944,13 +1031,14 @@ class FakePiHarness:
         return request
 
     def _wait_for_extension_response(
-        self, request_id: str, timeout_ms: int | None
+        self, request: JsonDict, timeout_ms: int | None
     ) -> JsonDict | None:
-        """Wait for a matching extension dialog response."""
-        self._pending_extension_id = request_id
+        """Emit a dialog request with its waiter ready, then await its response."""
+        self._pending_extension_id = request["id"]
         self._extension_response = None
         self._extension_waiter.clear()
         try:
+            self._write_json(request)
             if timeout_ms is None:
                 while not self._extension_waiter.wait(0.01):
                     if self._abort_requested.is_set():
@@ -995,7 +1083,7 @@ class FakePiHarness:
         thread = self._run_thread
         if thread is None:
             self.state.is_streaming = False
-            self._pending_steer_message = None
+            self._take_pending_steer()
             self._abort_requested.clear()
             return
         self._abort_requested.set()
@@ -1004,32 +1092,36 @@ class FakePiHarness:
         if self._run_thread is thread:
             self._run_thread = None
         self.state.is_streaming = False
-        self._pending_steer_message = None
+        self._take_pending_steer()
         self._abort_requested.clear()
 
-    def _start_run(self, *, name: str, target: Callable[[], None]) -> None:
+    def _start_run(
+        self, *, name: str, target: Callable[[], None], streaming: bool = True
+    ) -> None:
         """Start a daemon worker for prompt playback."""
 
         def runner() -> None:
             try:
-                # Image the ack->agent_start window so tests can deterministically
-                # exercise submission that has not started its run yet.
-                self._sleep_ms(self.pre_start_delay_ms, abortable=False)
+                # Image the ack->agent_start window for actual agent runs only.
+                if streaming:
+                    self._sleep_ms(self.pre_start_delay_ms, abortable=False)
                 target()
             finally:
                 if self._run_thread is thread:
                     self._run_thread = None
 
         thread = threading.Thread(target=runner, name=name, daemon=True)
-        self.state.is_streaming = True
+        self.state.is_streaming = streaming
         self._run_thread = thread
         thread.start()
 
     def _take_pending_steer(self) -> str | None:
         """Return and clear the queued steering message, if any."""
-        message = self._pending_steer_message
-        self._pending_steer_message = None
-        return message
+        with self._session_lock:
+            message = self._pending_steer_message
+            self._pending_steer_message = None
+            self.state.pending_message_count = 0
+            return message
 
     def _finish_run(self, messages: list[JsonDict], *, settled: bool = True) -> None:
         """End a low-level run, settling only when no continuation remains."""
@@ -1037,10 +1129,14 @@ class FakePiHarness:
             {"type": "agent_end", "messages": messages, "willRetry": False}
         )
         if settled:
-            self.state.is_streaming = False
-            self._abort_requested.clear()
-            self._pending_steer_message = None
-            self._write_json({"type": "agent_settled"})
+            self._settle_run()
+
+    def _settle_run(self) -> None:
+        """Expose idle state and emit the final settlement."""
+        self.state.is_streaming = False
+        self._abort_requested.clear()
+        self._take_pending_steer()
+        self._write_json({"type": "agent_settled"})
 
     def _finish_aborted_run(self, message: JsonDict | None = None) -> None:
         """Finish the current run, emitting an active aborted MESSAGE first."""
@@ -1121,6 +1217,7 @@ class FakePiHarness:
             "api": self.state.model["api"],
             "provider": self.state.model["provider"],
             "model": self.state.model["id"],
+            "thinkingLevel": self.state.thinking_level,
             "usage": self._zero_usage(),
             "timestamp": now_ms(),
             "stopReason": "stop",
@@ -1134,6 +1231,7 @@ class FakePiHarness:
             "api": self.state.model["api"],
             "provider": self.state.model["provider"],
             "model": self.state.model["id"],
+            "thinkingLevel": self.state.thinking_level,
             "usage": self._zero_usage(),
             "timestamp": now_ms(),
             "stopReason": "aborted",
@@ -1660,10 +1758,9 @@ class FakePiHarness:
             self.state.session_id = snapshot["header"]["id"]
             self.state.session_name = snapshot["sessionName"]
             self.state.message_count = snapshot["messageCount"]
-            self.state.pending_message_count = 0
 
     def _append_session_entry(self, payload: JsonDict, *, prefix: str) -> str:
-        """Persist one complete v3 entry, advance the leaf, and refresh projections."""
+        """Record a v3 entry, flushing buffered records on first conversation."""
         with self._session_lock:
             entry_id = self._entry_id(prefix)
             timestamp_ms = max(now_ms(), self._last_entry_timestamp_ms + 1)
@@ -1677,25 +1774,29 @@ class FakePiHarness:
                 {key: value for key, value in payload.items() if key != "type"}
             )
             entries = [*self._session_entries, entry]
-            snapshot = self._build_session_snapshot(
-                Path(self.state.session_file), self._session_header, entries
-            )
-            with Path(self.state.session_file).open(
-                "a", encoding="utf-8", newline="\n"
-            ) as handle:
-                handle.write(self._encode_json(entry) + "\n")
+            path = Path(self.state.session_file)
+            snapshot = self._build_session_snapshot(path, self._session_header, entries)
+            if path.exists():
+                with path.open("a", encoding="utf-8", newline="\n") as handle:
+                    handle.write(self._encode_json(entry) + "\n")
+            elif entry["type"] == "message" and entry["message"]["role"] in (
+                "user", "assistant"
+            ):
+                with path.open("x", encoding="utf-8", newline="\n") as handle:
+                    for record in (self._session_header, *entries):
+                        handle.write(self._encode_json(record) + "\n")
             self._apply_session_snapshot(snapshot)
             return entry_id
 
     def _reset_session_file(self) -> None:
-        """Create and install a fresh valid empty v3 session file."""
-        self._message_serial = 0
-        session_id = f"fake-{uuid.uuid4().hex[:8]}"
-        path = self._session_root / f"{session_id}.jsonl"
-        header = self._new_session_header(session_id, cwd=str(Path.cwd().resolve()))
-        snapshot = self._build_session_snapshot(path, header, [])
-        path.write_bytes((self._encode_json(header) + "\n").encode("utf-8"))
-        self._apply_session_snapshot(snapshot)
+        """Allocate a fresh v3 header and path in memory without writing bytes."""
+        with self._session_lock:
+            self._message_serial = 0
+            session_id = f"fake-{uuid.uuid4().hex[:8]}"
+            path = self._session_root / f"{session_id}.jsonl"
+            header = self._new_session_header(session_id, cwd=str(Path.cwd().resolve()))
+            snapshot = self._build_session_snapshot(path, header, [])
+            self._apply_session_snapshot(snapshot)
 
     def _entry_id(self, prefix: str) -> str:
         """Return a deterministic entry ID that does not collide after switches."""

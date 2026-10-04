@@ -138,6 +138,13 @@ time; each toolcall stream has at most one queued paint.")
 (defvar-local pilish--stream-delta-flush-timer nil
   "The one pending one-shot streaming delta flush timer, or nil.")
 
+(defvar-local pilish--pending-tool-updates nil
+  "Alist of (TOOL-CALL-ID . VALUE) awaiting coalesced rendering.
+VALUE is an ordinary partial result or a compound block with retained facts.
+Only the latest paint per owner is kept; superseded ordinary snapshots
+are dropped.  New entries are pushed, so flushing iterates the reversed
+alist to render first-queued-first.")
+
 (defconst pilish--md-ts-known-change-hooks
   '(md-ts--font-lock-record-dirty-side-effect-bounds
     md-ts--font-lock-record-stale-side-effect-bounds
@@ -907,7 +914,14 @@ the unpainted batch."
   (pilish--clear-local-user-message-region)
   (setq pilish--in-thinking-block nil)
   (pilish--reset-thinking-state)
-  (let ((inhibit-read-only t))
+  (let ((inhibit-read-only t)
+        ;; Trailing whitespace may be an empty tool's header terminator.
+        ;; Keep that boundary intact for retained, late execution results.
+        (last-tool-header
+         (when-let* ((overlay (car (last (pilish--tool-block-overlays-in-region
+                                         (point-min) (point-max)))))
+                     (header (overlay-get overlay 'pilish-header-end)))
+           (marker-position header))))
     (pilish--finalize-live-tool-blocks 'pilish-tool-block-error)
     (pilish--reset-toolcall-streams)
     (when pilish--tool-args-cache
@@ -917,16 +931,19 @@ the unpainted batch."
       (pilish--with-scroll-preservation
         (save-excursion
           (goto-char (point-max))
-          (skip-chars-backward " \t\n")
+          (skip-chars-backward " \t\n" last-tool-header)
           (delete-region (point) (point-max))
-          (insert "\n\n" (propertize "[Aborted]" 'face 'error) "\n")))
+          (unless (eq (char-before) ?\n)
+            (insert "\n"))
+          (insert "\n" (propertize "[Aborted]" 'face 'error) "\n")))
       (pilish--clear-followup-queue))
     (pilish--with-scroll-preservation
       (save-excursion
         (goto-char (point-max))
-        (skip-chars-backward "\n")
+        (skip-chars-backward "\n" last-tool-header)
         (delete-region (point) (point-max))
-        (insert "\n"))))
+        (unless (eq (char-before) ?\n)
+          (insert "\n")))))
   (pilish--set-activity-phase
    (if (eq pilish--status 'sending) "thinking" "idle"))
   (pilish--refresh-header))
@@ -1191,20 +1208,49 @@ Include optional STDERR in a text fence and optional DETAIL before it."
                (_ ""))
              msg)))
 
+(defun pilish--complete-extension-ui-dialog (event proc read-response)
+  "Attempt one response to supported-dialog EVENT on PROC.
+Call READ-RESPONSE with no arguments to obtain the complete
+success response plist; call it even when PROC is nil, so readers
+work without a process.  Mark the attempt before sending: a failed
+send is neither retried nor replaced by cancellation, and delivery
+is not guaranteed.  Any exit before the first attempt -- reader
+error, user quit, or a throw -- tries a `:cancelled' response when
+PROC is non-nil.  `error' and `quit', including from cancellation
+itself, return nil.  Other nonlocal exits propagate when cleanup
+completes normally."
+  (let ((response-attempted nil))
+    (condition-case nil
+        (unwind-protect
+            (let ((response (funcall read-response)))
+              (when proc
+                (setq response-attempted t)
+                (pilish--send-extension-ui-response proc response)))
+          (when (and proc (not response-attempted))
+            (setq response-attempted t)
+            (pilish--send-extension-ui-response
+             proc
+             (list :type "extension_ui_response"
+                   :id (plist-get event :id)
+                   :cancelled t))))
+      ((error quit) nil))
+    nil))
+
 (defun pilish--extension-ui-confirm (event proc)
   "Handle confirm method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (msg (plist-get event :message))
-         ;; Don't add colon if title already ends with one
-         (separator (if (string-suffix-p ":" title) " " ": "))
-         (prompt (format "%s%s%s " title separator msg))
-         (confirmed (yes-or-no-p prompt)))
-    (when proc
-      (pilish--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :confirmed (if confirmed t :json-false))))))
+  (pilish--complete-extension-ui-dialog
+   event proc
+   (lambda ()
+     (let* ((id (plist-get event :id))
+            (title (plist-get event :title))
+            (msg (plist-get event :message))
+            ;; Don't add colon if title already ends with one
+            (separator (if (string-suffix-p ":" title) " " ": "))
+            (prompt (format "%s%s%s " title separator msg))
+            (confirmed (yes-or-no-p prompt)))
+       (list :type "extension_ui_response"
+             :id id
+             :confirmed (if confirmed t :json-false))))))
 
 (defun pilish--extension-ui-select-minibuffer-setup ()
   "Set up the minibuffer for an extension UI selection."
@@ -1231,32 +1277,37 @@ Include optional STDERR in a text fence and optional DETAIL before it."
 
 (defun pilish--extension-ui-select (event proc)
   "Handle select method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (options (append (plist-get event :options) nil))
-         (completion-extra-properties
-          (cons :eager-display (cons t completion-extra-properties)))
-         (selected
-          (minibuffer-with-setup-hook
-              (:append #'pilish--extension-ui-select-minibuffer-setup)
-            (completing-read (concat title " ") options nil t))))
-    (when proc
-      (pilish--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :value selected)))))
+  (pilish--complete-extension-ui-dialog
+   event proc
+   (lambda ()
+     (let* ((id (plist-get event :id))
+            (title (plist-get event :title))
+            (options (append (plist-get event :options) nil))
+            (completion-extra-properties
+             (cons :eager-display (cons t completion-extra-properties)))
+            (selected
+             (minibuffer-with-setup-hook
+                 (:append #'pilish--extension-ui-select-minibuffer-setup)
+               (completing-read (concat title " ") options nil t))))
+       (list :type "extension_ui_response"
+             :id id
+             :value selected)))))
 
 (defun pilish--extension-ui-input (event proc)
   "Handle input method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (placeholder (plist-get event :placeholder))
-         (value (read-string (concat title " ") placeholder)))
-    (when proc
-      (pilish--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :value value)))))
+  (pilish--complete-extension-ui-dialog
+   event proc
+   (lambda ()
+     (let* ((id (plist-get event :id))
+            (title (plist-get event :title))
+            (placeholder (plist-get event :placeholder))
+            (prompt (if (and placeholder (not (string-empty-p placeholder)))
+                        (format "%s (%s) " title placeholder)
+                      (concat title " ")))
+            (value (read-string prompt)))
+       (list :type "extension_ui_response"
+             :id id
+             :value value)))))
 
 (defun pilish--extension-ui-set-editor-text (event)
   "Handle set_editor_text method from EVENT."
@@ -1367,7 +1418,7 @@ which asks upfront before any buffers are touched."
     (pilish--cancel-inactivity-timer)
     (pilish--cancel-tool-update-flush)
     (pilish--cancel-stream-delta-flush)
-    (pilish--cancel-tool-cooling)
+    (pilish--release-nested-tool-state)
     (pilish--invalidate-prompt-start-wait)
     (pilish--set-activity-phase "idle" 'teardown t)
     (dolist (proc (delete-dups (delq nil (list pilish--process
@@ -1417,13 +1468,13 @@ which asks upfront before any buffers are touched."
     (when-let* ((chat-buf (process-get process 'pilish-chat-buffer)))
       (when (buffer-live-p chat-buf)
         (with-current-buffer chat-buf
-          (unwind-protect
-              (if (equal (plist-get event :type) "queue_update")
-                  (when (eq process pilish--process)
-                    (force-mode-line-update t))
-                (pilish--handle-display-event event))
-            (when (eq process pilish--process)
-              (pilish--reconcile-inactivity-timer))))))))
+          (when (eq process pilish--process)
+            (unwind-protect
+                (if (equal (plist-get event :type) "queue_update")
+                    (force-mode-line-update t)
+                  (pilish--handle-display-event event))
+              (when (eq process pilish--process)
+                (pilish--reconcile-inactivity-timer)))))))))
 
 (defun pilish--make-process-exit-handler (process)
   "Create a frontend cleanup handler for PROCESS exit."
@@ -1515,8 +1566,12 @@ Updates buffer-local state and renders display updates."
         (pilish--queue-stream-delta
          delta-kind
          (plist-get (plist-get event :assistantMessageEvent) :delta))))
-    ;; Then handle display
+    ;; Explicit-parent executions belong to their root, never the ordinary
+    ;; display path.  Protocol state above still sees every event.
     (pcase (plist-get event :type)
+    ((and (or "tool_execution_start" "tool_execution_update" "tool_execution_end")
+          (guard (plist-member event :parentToolCallId)))
+     (pilish--handle-nested-tool-event event hover-time))
     ("agent_start"
      (pilish--hover-clear-live-state)
      (pilish--note-prompt-start)
@@ -1625,7 +1680,17 @@ Updates buffer-local state and renders display updates."
          (pilish--reset-toolcall-streams)
          (pilish--refresh-header))
        (when (equal role "toolResult")
-         (pilish--hover-update-tool-from-result message))
+         (pilish--hover-update-tool-from-result message)
+         (when-let* ((id (plist-get message :toolCallId))
+                     (block (or (pilish--nested-tool-owner id)
+                                (pilish--tool-block-get id)))
+                     ((equal id (pilish--tool-block-tool-call-id block))))
+           (pilish--merge-saved-nested-calls block (plist-get message :nestedCalls))
+           (pilish--merge-codemode-calls
+            block (pilish--tool-arg-get (plist-get message :details) :calls) t)
+           (when (pilish--tool-block-compound-p block)
+             (pilish--discard-pending-tool-update id)
+             (pilish--redraw-compound-tool block))))
        (when assistant-p
          (pilish--render-complete-message)
          ;; message_end.message is authoritative; state has already cleared
@@ -1645,27 +1710,36 @@ Updates buffer-local state and renders display updates."
          (unless block
            (setq block (pilish--display-tool-start
                         (plist-get event :toolName) args tool-call-id)))
-         (pilish--tool-block-set-execution-start block hover-time)
+         (pilish--tool-block-set-execution-start block hover-time args)
+         (when (equal (plist-get event :toolName) "codemode")
+           (pilish--enable-compound-tool block args))
          ;; Update header and path from authoritative args.
          ;; During streaming, the header may show placeholders since delta
          ;; args can be partial.  Execution start carries the real args.
          (pilish--display-tool-update-header
           (plist-get event :toolName) args block)
          (pilish--tool-block-sync-path-metadata
-          block (pilish--tool-arg-path args)))))
+          block (pilish--tool-arg-path args))
+         (when (pilish--tool-block-compound-p block)
+           (pilish--redraw-compound-tool block)))))
     ("tool_execution_end"
      (pilish--set-activity-phase "thinking")
      (let* ((tool-call-id (plist-get event :toolCallId))
             (result (plist-get event :result))
             ;; A keyed miss must not finalize an unrelated legacy block.
             (block (or (pilish--tool-block-get tool-call-id)
+                       (pilish--nested-tool-owner tool-call-id)
                        (and (pilish--tool-call-id-p tool-call-id)
                             (pilish--display-tool-start
                              (plist-get event :toolName) nil tool-call-id))))
-            ;; Retrieve cached args since tool_execution_end doesn't include args
-            (args (when (and tool-call-id pilish--tool-args-cache)
-                    (prog1 (gethash tool-call-id pilish--tool-args-cache)
-                      (remhash tool-call-id pilish--tool-args-cache))))
+            ;; Compound execution args outlive the ordinary per-turn cache.
+            (args (let ((cached
+                         (when (and tool-call-id pilish--tool-args-cache)
+                           (prog1 (gethash tool-call-id pilish--tool-args-cache)
+                             (remhash tool-call-id pilish--tool-args-cache)))))
+                    (if (and block (pilish--tool-block-compound-p block))
+                        (pilish--tool-block-args block)
+                      cached)))
             (duration (pilish--hover-elapsed
                        (and block (pilish--tool-block-execution-start block))
                        hover-time)))
@@ -1681,14 +1755,18 @@ Updates buffer-local state and renders display updates."
        (when block
          (pilish--complete-tool-hover block (plist-get event :toolName) args duration))))
     ("tool_execution_update"
-     (let ((tool-call-id (plist-get event :toolCallId))
-           (partial-result (plist-get event :partialResult)))
-       (if tool-call-id
-           ;; Coalesce: keep only the latest preview per tool call and
-           ;; render at the flush cadence, not once per event.
-           (pilish--queue-tool-update tool-call-id partial-result)
-         ;; No toolCallId: render through the legacy compatibility block.
-         (pilish--display-tool-update partial-result nil))))
+     (let* ((tool-call-id (plist-get event :toolCallId))
+            (partial-result (plist-get event :partialResult))
+            (block (or (pilish--nested-tool-owner tool-call-id)
+                       (pilish--tool-block-get tool-call-id))))
+       (cond
+        ((and block (pilish--tool-block-compound-p block))
+         ;; Retain parent facts before coalescing the same owner as children.
+         ;; A late update cannot replace a finalized parent's result.
+         (when (eq block (pilish--tool-block-get tool-call-id))
+           (pilish--display-tool-update partial-result block)))
+        (tool-call-id (pilish--queue-tool-update tool-call-id partial-result))
+        (t (pilish--display-tool-update partial-result nil)))))
     ("compaction_start"
      (when pilish--aborted
        (pilish--send-abort))
@@ -1699,9 +1777,13 @@ Updates buffer-local state and renders display updates."
     ("compaction_end"
      (pilish--handle-compaction-end-event event))
     ("agent_end"
-     ;; Defensively drop pending tool previews and cancel their flush timer; any
-     ;; tool still running here is aborted and its block is finalized below.
-     (pilish--cancel-tool-update-flush)
+     ;; Ordinary previews end here; nested execution obligations and their
+     ;; coalesced owner paints outlive the agent loop.
+     (setq pilish--pending-tool-updates
+           (seq-filter (lambda (entry) (pilish--tool-block-p (cdr entry)))
+                       pilish--pending-tool-updates))
+     (unless pilish--pending-tool-updates
+       (pilish--cancel-tool-update-flush))
      (pilish--set-canonical-messages
       (plist-get pilish--state :messages))
      (pilish--display-agent-end)
@@ -1809,7 +1891,7 @@ consistent.  Pending deferred cooling is invalidated first.  Tree-sitter
 overlays are left alone."
   (pilish--cancel-tool-update-flush)
   (pilish--cancel-stream-delta-flush)
-  (pilish--cancel-tool-cooling)
+  (pilish--release-nested-tool-state)
   (remove-overlays (point-min) (point-max) 'pilish-tool-block t)
   (remove-overlays (point-min) (point-max) 'pilish-diff-overlay t)
   (let ((inhibit-read-only t))
@@ -1840,7 +1922,617 @@ overlays are left alone."
   last-tail
   image-previews
   execution-start
-  help-echo)
+  help-echo
+  compound-p
+  args
+  result
+  displayed-output                   ; Parent presentation used by the last paint.
+  script-line-map                    ; Painted preview's source rows; nil when full.
+  nested-calls
+  folds
+  history-p
+  summary-incomplete-p)
+
+(cl-defstruct (pilish--nested-call
+               (:constructor pilish--make-nested-call))
+  "One nested call's live or saved facts, stored in display order."
+  id
+  name
+  arguments
+  arguments-bytes
+  args-preview
+  status
+  duration-ms
+  error
+  cost
+  source
+  started-at
+  pending-end-p
+  result)
+
+(defvar-local pilish--nested-tool-owners nil
+  "Real root and descendant IDs mapped to their retained owning root block.
+Child records live only in the root's ordered `nested-calls' list.  This
+index outlives ordinary execution registration, never a transcript teardown.")
+
+(defun pilish--nested-tool-owner (id)
+  "Return the retained root owning real execution ID, or nil."
+  (and pilish--nested-tool-owners
+       (gethash id pilish--nested-tool-owners)))
+
+(defun pilish--nested-call-get (block id)
+  "Return BLOCK's nested call with exact ID, or nil."
+  (seq-find (lambda (call) (equal id (pilish--nested-call-id call)))
+            (pilish--tool-block-nested-calls block)))
+
+(defun pilish--promote-nested-call (block call)
+  "Place CALL after BLOCK's observed/saved rows and before unmatched details.
+Reuse the exact record and preserve the other rows' order."
+  (let* ((others (delq call (pilish--tool-block-nested-calls block)))
+         (details-p (lambda (row) (eq (pilish--nested-call-source row) 'details))))
+    (setf (pilish--tool-block-nested-calls block)
+          (append (seq-remove details-p others) (list call)
+                  (seq-filter details-p others)))))
+
+(defun pilish--nested-pending-p (block)
+  "Return non-nil when BLOCK has an observed descendant still owing an end."
+  (and block
+       (seq-some #'pilish--nested-call-pending-end-p
+                 (pilish--tool-block-nested-calls block))))
+
+(defun pilish--enable-compound-tool (block args &optional history-p)
+  "Retain compound BLOCK's authoritative ARGS.
+With HISTORY-P, do not register execution ownership; otherwise index the
+live root's exact real ID."
+  (setf (pilish--tool-block-compound-p block) t
+        (pilish--tool-block-args block) args
+        (pilish--tool-block-history-p block) history-p)
+  (unless history-p
+    (unless pilish--nested-tool-owners
+      (setq pilish--nested-tool-owners (make-hash-table :test 'equal)))
+    (when-let* ((id (pilish--tool-block-tool-call-id block))
+                ((pilish--tool-call-id-p id)))
+      (puthash id block pilish--nested-tool-owners)))
+  block)
+
+(defun pilish--handle-nested-tool-event (event time)
+  "Ingest explicit-parent execution EVENT using local seconds TIME.
+Unknown parents are ignored.  Only an observed start supplies timing;
+starts/updates owe an end, and repeated events cannot reopen ended calls."
+  (let* ((parent-id (plist-get event :parentToolCallId))
+         (id (plist-get event :toolCallId))
+         (block (or (pilish--nested-tool-owner parent-id)
+                    (pilish--tool-block-get parent-id))))
+    (when (and block (pilish--tool-call-id-p id))
+      (unless (pilish--tool-block-compound-p block)
+        (pilish--enable-compound-tool block (pilish--tool-block-args block)))
+      ;; Anonymous details are a whole-snapshot fallback, never event rows.
+      (setf (pilish--tool-block-nested-calls block)
+            (seq-filter #'pilish--nested-call-id (pilish--tool-block-nested-calls block)))
+      (let ((call (pilish--nested-call-get block id)))
+        (when (or (null call) (memq (pilish--nested-call-source call) '(details saved)))
+          (unless call (setq call (pilish--make-nested-call :id id)))
+          (setf (pilish--nested-call-name call) (plist-get event :toolName)
+                (pilish--nested-call-arguments call)
+                (if (plist-member event :args) (plist-get event :args)
+                  (pilish--nested-call-arguments call))
+                (pilish--nested-call-source call) 'event
+                (pilish--nested-call-status call)
+                (if (eq (pilish--nested-call-status call) 'cancelled) 'cancelled 'running)
+                (pilish--nested-call-pending-end-p call) t)
+          (pilish--promote-nested-call block call)
+          (puthash id block pilish--nested-tool-owners))
+        (when (pilish--nested-call-pending-end-p call)
+          (pcase (plist-get event :type)
+            ("tool_execution_start"
+             (unless (pilish--nested-call-started-at call)
+               (setf (pilish--nested-call-started-at call) time
+                     (pilish--nested-call-name call) (plist-get event :toolName)
+                     (pilish--nested-call-arguments call) (plist-get event :args))))
+            ("tool_execution_end"
+             (setf (pilish--nested-call-pending-end-p call) nil
+                   (pilish--nested-call-status call)
+                   (if (eq t (plist-get event :isError))
+                       (if (eq (pilish--nested-call-status call) 'cancelled) 'cancelled 'error)
+                     'ok)
+                   (pilish--nested-call-result call)
+                   (let ((result (plist-get event :result)))
+                     (if (and (listp result)
+                              (vectorp (plist-get result :content)))
+                         result
+                       '(:content []))))
+             (when-let* ((start (pilish--nested-call-started-at call)))
+               (setf (pilish--nested-call-duration-ms call)
+                     (* 1000 (max 0 (- time start)))))))
+          (if (equal (plist-get event :type) "tool_execution_update")
+              (pilish--queue-tool-update (pilish--tool-block-tool-call-id block) block)
+            (pilish--discard-pending-tool-update (pilish--tool-block-tool-call-id block))
+            (pilish--redraw-compound-tool block))
+          (unless (pilish--nested-pending-p block)
+            (pilish--queue-tool-cooling-outside-hot-tail))))))
+  nil)
+
+(defun pilish--nested-metadata-number-p (value)
+  "Return non-nil for a finite, nonnegative metadata number VALUE."
+  (and (numberp value) (>= value 0) (< value 1.0e+INF)))
+
+(defun pilish--merge-saved-nested-calls (block nested-calls)
+  "Merge saved NESTED-CALLS facts into BLOCK without execution obligations.
+Exact event-backed status, arguments and received results remain authoritative.
+Saved rows supply no ancestry or child output.  A valid container, even empty,
+enables the shared compound presentation."
+  (let ((calls (pilish--tool-arg-get nested-calls :calls)))
+    (when (vectorp calls)
+      (pilish--enable-compound-tool block (pilish--tool-block-args block)
+                                    (pilish--tool-block-history-p block))
+      (setf (pilish--tool-block-summary-incomplete-p block)
+            (eq :false (pilish--tool-arg-get nested-calls :complete)))
+      (dolist (row (append calls nil))
+        (let* ((id (pilish--tool-arg-get row :id))
+               (name (pilish--tool-arg-get row :name))
+               (status (pcase (pilish--tool-arg-get row :status)
+                         ("ok" 'ok) ("error" 'error) ("unfinished" 'unfinished)))
+               (arguments (pilish--tool-arg-get row :arguments)))
+          (when (and (pilish--tool-call-id-p id) (stringp name) status)
+            (let ((call (pilish--nested-call-get block id)))
+              (unless call
+                (setq call (pilish--make-nested-call :id id :source 'saved)))
+              (unless (eq (pilish--nested-call-source call) 'event)
+                (setf (pilish--nested-call-source call) 'saved
+                      (pilish--nested-call-name call) name
+                      (pilish--nested-call-status call) status)
+                (pilish--promote-nested-call block call))
+              (when (and (null (pilish--nested-call-arguments call)) (listp arguments))
+                (setf (pilish--nested-call-arguments call) arguments))
+              (when-let* (((eq (pilish--nested-call-source call) 'saved))
+                          ((not (pilish--tool-arg-member row :arguments)))
+                          (bytes (pilish--tool-arg-get row :argumentsBytes))
+                          ((integerp bytes)) ((>= bytes 0)))
+                (setf (pilish--nested-call-arguments-bytes call) bytes))
+              (when-let* ((duration (pilish--tool-arg-get row :durationMs))
+                          ((pilish--nested-metadata-number-p duration)))
+                (setf (pilish--nested-call-duration-ms call) duration))
+              (when-let* ((error-text (pilish--tool-arg-get row :error)) ((stringp error-text)))
+                (setf (pilish--nested-call-error call) error-text))))))))
+  nil)
+
+(defun pilish--merge-codemode-calls (block calls &optional saved-p)
+  "Merge codemode metadata into BLOCK.
+CALLS supplies exact-ID rows; previews are text, never arguments or output.
+A calls array, even empty, enables compound presentation.
+SAVED-P makes unmatched running metadata unfinished rather than live work."
+  (when (and (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
+                    "codemode")
+             (vectorp calls))
+    (pilish--enable-compound-tool block (pilish--tool-block-args block)
+                                  (pilish--tool-block-history-p block))
+    (setf (pilish--tool-block-nested-calls block)
+          (seq-filter #'pilish--nested-call-id (pilish--tool-block-nested-calls block)))
+    (dolist (row (append calls nil))
+      (let* ((id (pilish--tool-arg-get row :id))
+             (anonymous-p (and (stringp id) (string-suffix-p "/?" id)))
+             (name (pilish--tool-arg-get row :name))
+             (status (pcase (pilish--tool-arg-get row :status)
+                       ("running" 'running) ("ok" 'ok)
+                       ("error" 'error) ("cancelled" 'cancelled))))
+        (when (and (pilish--tool-call-id-p id) (stringp name) status
+                   (not (and anonymous-p
+                             (seq-some (lambda (call)
+                                         (memq (pilish--nested-call-source call) '(event saved)))
+                                       (pilish--tool-block-nested-calls block)))))
+          (let ((call (unless anonymous-p (pilish--nested-call-get block id))))
+            (unless call
+              (setq call (pilish--make-nested-call :id (unless anonymous-p id)
+                                                 :name name :source 'details))
+              (setf (pilish--tool-block-nested-calls block)
+                    (nconc (pilish--tool-block-nested-calls block) (list call))))
+            (when (eq (pilish--nested-call-source call) 'details)
+              (setf (pilish--nested-call-name call) name
+                    (pilish--nested-call-status call)
+                    (if (and saved-p (eq status 'running)) 'unfinished status)))
+            ;; Cancellation is exact-ID evidence, not an execution end.  Only
+            ;; pending work or an observed/saved failure can be refined; success
+            ;; and saved unfinished facts remain authoritative.
+            (when (and (eq status 'cancelled)
+                       (or (pilish--nested-call-pending-end-p call)
+                           (eq (pilish--nested-call-status call) 'error)))
+              (setf (pilish--nested-call-status call) 'cancelled))
+            (when-let* ((preview (pilish--tool-arg-get row :args)) ((stringp preview)))
+              (setf (pilish--nested-call-args-preview call) preview))
+            (when-let* ((duration (pilish--tool-arg-get row :durationMs))
+                        ((pilish--nested-metadata-number-p duration)))
+              (setf (pilish--nested-call-duration-ms call) duration))
+            (when-let* ((error-text (pilish--tool-arg-get row :error)) ((stringp error-text)))
+              (setf (pilish--nested-call-error call) error-text))
+            (when-let* ((cost (pilish--tool-arg-get row :cost))
+                        ((pilish--nested-metadata-number-p cost)))
+              (setf (pilish--nested-call-cost call) cost)))))))
+  nil)
+
+(defun pilish--compound-tool-details (block)
+  "Return BLOCK's parent details without already presented codemode fields."
+  (let ((details (plist-get (pilish--tool-block-result block) :details)))
+    (if (and (listp details)
+             (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name) "codemode"))
+        (cl-loop for (key value) on details by #'cddr
+                 unless (memq key '(:calls :fullOutputPath)) append (list key value))
+      details)))
+
+(defun pilish--nested-call-summary (call history-p)
+  "Return CALL's compact, propertized summary.
+HISTORY-P distinguishes saved unfinished work from a stopped live process."
+  (let* ((arguments (pilish--nested-call-arguments call))
+         ;; Native JSON serialization returns UTF-8 bytes, not display characters.
+         (preview (if arguments
+                      (decode-coding-string (json-serialize arguments) 'utf-8)
+                    (pilish--nested-call-args-preview call)))
+         (status (pilish--nested-call-status call))
+         (duration (pilish--nested-call-duration-ms call)))
+    (propertize
+     (concat "  " (pcase status
+                     ('running "…") ('ok "✓") ('error "✗")
+                     ('cancelled "⊘") (_ "?"))
+             " " (pilish--tool-display-value-string (pilish--nested-call-name call))
+             (when (and preview (not (string-empty-p preview)))
+               (concat " " (pilish--truncate-string
+                            (pilish--tool-display-value-string preview) 80)))
+             (when duration
+               (propertize (if (< duration 1000)
+                               (format " %.0fms" duration)
+                             (format " %.1fs" (/ duration 1000.0)))
+                           'pilish-nested-duration t))
+             (when-let* ((cost (pilish--nested-call-cost call)))
+               (format " $%.2g" cost))
+             (when (eq status 'unfinished)
+               (if history-p " unfinished when saved" " unfinished"))
+             (when (memq status '(error cancelled))
+               (let ((error-text (or (pilish--nested-call-error call)
+                                     (pilish--extract-text-from-content
+                                      (plist-get (pilish--nested-call-result call) :content)))))
+                 (unless (string-empty-p error-text)
+                   (concat " — " (pilish--truncate-string
+                                  (pilish--tool-display-value-string error-text) 80))))))
+     'pilish-nested-summary t 'pilish-nested-call-id (pilish--nested-call-id call)
+     'pilish-no-fontify t)))
+
+(defun pilish--insert-compound-tool-button (label section)
+  "Insert a fold button with LABEL for compound SECTION."
+  (insert-text-button label
+                      'face 'pilish-collapsed-indicator
+                      'action #'pilish--toggle-compound-tool-section
+                      'follow-link t 'pilish-tool-toggle t
+                      'pilish-tool-section section))
+
+(defun pilish--compound-tool-code (block)
+  "Return authoritative JavaScript from compound codemode BLOCK, or nil."
+  (when (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
+               "codemode")
+    (let ((code (pilish--tool-arg-get (pilish--tool-block-args block) :code)))
+      (and (stringp code) (not (string-empty-p code)) code))))
+
+(defun pilish--insert-compound-tool-body (block &optional output-presentation)
+  "Insert BLOCK's compound body at point without child tool overlays.
+Reuse ordinary result selection and rich-output insertion directly.
+OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
+  (let* ((folds (pilish--tool-block-folds block))
+         script-line-map
+         (presentation
+          (or output-presentation
+              (when-let* ((result (pilish--tool-block-result block)))
+                (pilish--tool-result-presentation
+                 (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
+                 (pilish--tool-block-args block)
+                 (plist-get result :content) (pilish--compound-tool-details block)
+                 (plist-get result :isError))))))
+    (when-let* ((code (pilish--compound-tool-code block)))
+      (let* ((start (point))
+             (truncation (pilish--truncate-to-visual-lines
+                          code pilish-tool-preview-lines (pilish--chat-display-width)))
+             (hidden (plist-get truncation :hidden-lines))
+             (expanded (member 'script folds)))
+        (pilish--insert-rendered-tool-content
+         (if (or expanded (= hidden 0))
+             (string-trim-right code "\n+")
+           (plist-get truncation :content))
+         "javascript" nil)
+        (when (> hidden 0)
+          (pilish--insert-compound-tool-button
+           (if expanded "[-]" (pilish--tool-hidden-line-label hidden)) 'script)
+          (insert "\n"))
+        (setq script-line-map
+              (when (and (not expanded) (> hidden 0)) (plist-get truncation :line-map)))
+        (add-text-properties start (point) '(pilish-tool-section script))))
+    (when presentation
+      (let* ((start (point))
+             (text (plist-get presentation :text))
+             (truncation (pilish--truncate-to-visual-lines
+                          text (plist-get presentation :preview-limit)
+                          (pilish--chat-display-width)))
+             (hidden (plist-get truncation :hidden-lines))
+             (expanded (member 'output folds)))
+        (pilish--insert-rendered-tool-content
+         (if (or expanded (= hidden 0))
+             (string-trim-right text "\n+")
+           (plist-get truncation :content))
+         (plist-get presentation :lang) (plist-get presentation :is-edit-diff))
+        (when (> hidden 0)
+          (pilish--insert-compound-tool-button
+           (if expanded "[-]" (pilish--tool-hidden-line-label hidden)) 'output)
+          (insert "\n"))
+        (pilish--insert-image-previews (plist-get presentation :images))
+        (setf (pilish--tool-block-offset block) (plist-get presentation :offset)
+              (pilish--tool-block-line-map block)
+              (when (and (not expanded) (> hidden 0)) (plist-get truncation :line-map)))
+        (add-text-properties start (point) '(pilish-tool-section output))))
+    (when-let* (((equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name) "codemode"))
+                (path (pilish--tool-arg-get (plist-get (pilish--tool-block-result block) :details)
+                                            :fullOutputPath))
+                ((stringp path)))
+      (insert (propertize (concat "Full output: " (pilish--tool-display-value-string path) "\n")
+                          'pilish-no-fontify t 'pilish-tool-section 'full-output)))
+    (when-let* ((calls (pilish--tool-block-nested-calls block)))
+      (let* ((start (point))
+             (expanded (member 'children folds))
+             (hidden (if expanded 0 (max 0 (- (length calls) pilish-tool-preview-lines)))))
+        (insert "Child calls\n")
+        (when (> hidden 0)
+          (pilish--insert-compound-tool-button
+           (format "... (%d earlier calls)" hidden) 'children)
+          (insert "\n"))
+        (when (and expanded (> (length calls) (max 0 pilish-tool-preview-lines)))
+          (pilish--insert-compound-tool-button "[-]" 'children)
+          (insert "\n"))
+        ;; The list's bounds are stamped first; child sections override them.
+        (add-text-properties start (point) '(pilish-tool-section children))
+        (dolist (call (nthcdr hidden calls))
+          (let* ((child-start (point))
+                 (section (cons 'child (pilish--nested-call-id call)))
+                 (open (member section folds))
+                 (child-result (pilish--nested-call-result call))
+                 (presentation
+                  (when child-result
+                    (pilish--tool-result-presentation
+                     (pilish--nested-call-name call) (pilish--nested-call-arguments call)
+                     (plist-get child-result :content) (plist-get child-result :details)
+                     (not (null (memq (pilish--nested-call-status call) '(error cancelled))))
+                     (not open))))
+                 (text (plist-get presentation :text))
+                 (images (plist-get presentation :images)))
+            (insert (propertize
+                     (pilish--nested-call-summary
+                      call (or (pilish--tool-block-history-p block)
+                               (eq (pilish--nested-call-source call) 'saved)))
+                     'pilish-nested-root-id (pilish--tool-block-tool-call-id block)))
+            (when-let* (((eq (pilish--nested-call-source call) 'saved))
+                        (bytes (pilish--nested-call-arguments-bytes call)))
+              (insert (propertize (format " saved arguments omitted (%d bytes)" bytes)
+                                  'pilish-no-fontify t)))
+            (when (or (plist-get presentation :image-content-p)
+                      images (and text (not (string-empty-p text))))
+              (insert " ")
+              (pilish--insert-compound-tool-button
+               (if open "[- output]" "[+ output]") section))
+            (insert "\n")
+            (when open
+              (when (and text (not (string-empty-p text)))
+                (pilish--insert-rendered-tool-content
+                 (string-trim-right text "\n+") (plist-get presentation :lang)
+                 (plist-get presentation :is-edit-diff)))
+              (pilish--insert-image-previews images))
+            (add-text-properties child-start (point) (list 'pilish-tool-section section))))
+        (when (pilish--tool-block-history-p block)
+          (insert (propertize "Child outputs are not saved in sessions.\n"
+                              'pilish-no-fontify t 'pilish-tool-section 'children)))))
+    (when (pilish--tool-block-summary-incomplete-p block)
+      (insert (propertize "Incomplete saved call summary\n"
+                          'pilish-no-fontify t 'pilish-tool-section 'children)))
+    (setf (pilish--tool-block-displayed-output block) presentation
+          (pilish--tool-block-script-line-map block) script-line-map)))
+
+(defun pilish--toggle-compound-tool-section (button)
+  "Toggle only BUTTON's compound fold key."
+  (when-let* ((overlay (save-excursion
+                        (goto-char (button-start button))
+                        (pilish--tool-overlay-at-point)))
+              (block (pilish--tool-block-from-overlay overlay))
+              ((pilish--tool-block-compound-p block)))
+    (let* ((section (button-get button 'pilish-tool-section))
+           (folds (pilish--tool-block-folds block))
+           (collapsing (member section folds)))
+      (setf (pilish--tool-block-folds block)
+            (if collapsing (remove section folds) (cons section folds)))
+      (pilish--redraw-compound-tool block section))))
+
+(defun pilish--tool-section-bounds (start end &optional line-maps)
+  "Return transient (KEY START END ROWS) section geometry in START..END.
+Each content row is (SOURCE-LINE START END).  LINE-MAPS associates section
+keys with preview vectors naming the original source lines; other rows
+use their displayed order.  Geometry belongs to this paint, not retained facts."
+  (let ((position start) sections)
+    (while (< position end)
+      (let ((next (next-single-property-change position 'pilish-tool-section nil end))
+            (key (get-text-property position 'pilish-tool-section)))
+        (when key
+          (let ((line-map (cdr (assoc key line-maps))))
+            (push (list key position next
+                        (seq-map-indexed
+                         (lambda (line index)
+                           (cons (if line-map (aref line-map index) (1+ index)) line))
+                         (pilish--tool-section-content-lines (list key position next))))
+                  sections)))
+        (setq position next)))
+    (nreverse sections)))
+
+(defun pilish--tool-section-content-lines (section)
+  "Return transient content-line spans for SECTION as (START END).
+Script and parent output exclude wrapper fences and their final newline.
+A child separates its summary from its displayed body rows, so summary
+width cannot change output coordinates.  The list keeps its heading."
+  (let* ((start (nth 1 section))
+         (end (nth 2 section))
+         (bounds
+          (pcase (car section)
+            ((or 'script 'output) (list (pilish--tool-fenced-content-bounds start end)))
+            ('children
+             (list (cons start (save-excursion
+                                 (goto-char start)
+                                 (min end (line-beginning-position 2))))))
+            (`(child . ,_)
+             (list (cons start (next-single-property-change
+                               start 'pilish-nested-summary nil end))
+                   (cons (save-excursion (goto-char start) (line-beginning-position 2))
+                         end)))))
+         lines)
+    (save-excursion
+      (dolist (region bounds)
+        (when region
+          (goto-char (car region))
+          (while (< (point) (cdr region))
+            (push (list (point) (min (cdr region) (line-beginning-position 2))) lines)
+            (forward-line 1)))))
+    (vconcat (nreverse lines))))
+
+(defun pilish--map-tool-section-position
+    (position old-sections new-sections start old-end new-end &optional toggled-section)
+  "Map POSITION through transient OLD-SECTIONS and NEW-SECTIONS.
+START, OLD-END and NEW-END delimit the body rewrite.  Outside positions
+use the existing cooling mapper.  Content follows its source row and
+character offset in either fold direction.  Vanished characters clamp to
+their section anchor, or the list header when the list hides that child.
+Decoration in TOGGLED-SECTION also clamps, never impersonating source text."
+  (if-let* ((old (seq-find (lambda (section)
+                            (and (>= position (nth 1 section)) (< position (nth 2 section))))
+                          old-sections)))
+      (if-let* ((new (assoc (car old) new-sections)))
+          (if-let* ((row (seq-find (lambda (row)
+                                    (and (>= position (nth 1 row)) (< position (nth 2 row))))
+                                  (nth 3 old))))
+              (let ((offset (- position (nth 1 row)))
+                    (target (assoc (car row) (nth 3 new))))
+                (if (and target (< offset (- (nth 2 target) (nth 1 target))))
+                    (+ (nth 1 target) offset)
+                  (nth 1 new)))
+            (if (equal (car old) toggled-section)
+                (nth 1 new)
+              (let ((offset (- position (nth 1 old))))
+                (+ (nth 1 new) (if (< offset (- (nth 2 new) (nth 1 new))) offset 0)))))
+        (or (nth 1 (assq 'children new-sections)) start))
+    (pilish--map-tool-cooling-position position start old-end new-end)))
+
+(defun pilish--redraw-compound-tool (block &optional toggled-section)
+  "Rewrite compound BLOCK within retained bounds and preserve each reader's view.
+Script and output coordinates always use the actual old and new painted
+line maps.  TOGGLED-SECTION identifies an explicit fold in either direction.
+Parent output folds use the last painted presentation so captured row spans
+and preview line maps share one source.  Pending updates still paint newer
+retained facts through the existing queue."
+  (when-let* ((overlay (pilish--tool-block-overlay block))
+              ((eq (overlay-buffer overlay) (current-buffer)))
+              (header (pilish--tool-block-header-end block))
+              (end (pilish--tool-block-end-marker block)))
+    (let* ((start (marker-position header))
+           (old-end (marker-position end))
+           (old-sections
+            (pilish--tool-section-bounds
+             start old-end
+             (list (cons 'script (pilish--tool-block-script-line-map block))
+                   (cons 'output (pilish--tool-block-line-map block)))))
+           (displayed-output (and (eq toggled-section 'output)
+                                  (pilish--tool-block-displayed-output block)))
+           (view (pilish--capture-tool-cooling-view))
+           (inhibit-read-only t))
+      (save-excursion
+        (remove-overlays start old-end 'pilish-diff-overlay t)
+        (delete-region start old-end)
+        (goto-char start)
+        (pilish--insert-compound-tool-body block displayed-output)
+        (set-marker header start)
+        (set-marker end (point))
+        (pilish--tool-block-refresh-overlay block)
+        (pilish--font-lock-ensure-excluding-property start (point) 'pilish-no-fontify))
+      (let* ((new-end (marker-position end))
+             (new-sections
+              (pilish--tool-section-bounds
+               start new-end
+               (list (cons 'script (pilish--tool-block-script-line-map block))
+                     (cons 'output (pilish--tool-block-line-map block))))))
+        (pilish--restore-tool-cooling-view
+         view start old-end new-end
+         (lambda (position)
+           (pilish--map-tool-section-position
+            position old-sections new-sections start old-end new-end toggled-section)))))))
+
+(defun pilish--release-nested-tool-block (block)
+  "Release BLOCK's retained routing, payloads, fold choices and markers."
+  (pilish--discard-pending-tool-update (pilish--tool-block-tool-call-id block))
+  (when pilish--nested-tool-owners
+    (remhash (pilish--tool-block-tool-call-id block) pilish--nested-tool-owners))
+  (dolist (call (pilish--tool-block-nested-calls block))
+    (when pilish--nested-tool-owners
+      (remhash (pilish--nested-call-id call) pilish--nested-tool-owners))
+    (setf (pilish--nested-call-arguments call) nil
+          (pilish--nested-call-arguments-bytes call) nil
+          (pilish--nested-call-args-preview call) nil
+          (pilish--nested-call-error call) nil
+          (pilish--nested-call-result call) nil
+          (pilish--nested-call-started-at call) nil
+          (pilish--nested-call-pending-end-p call) nil))
+  (setf (pilish--tool-block-args block) nil
+        (pilish--tool-block-result block) nil
+        (pilish--tool-block-displayed-output block) nil
+        (pilish--tool-block-script-line-map block) nil
+        (pilish--tool-block-nested-calls block) nil
+        (pilish--tool-block-folds block) nil
+        (pilish--tool-block-history-p block) nil
+        (pilish--tool-block-summary-incomplete-p block) nil
+        (pilish--tool-block-last-tail block) nil
+        (pilish--tool-block-image-previews block) nil
+        (pilish--tool-block-compound-p block) nil)
+  (set-marker (pilish--tool-block-header-end block) nil)
+  (set-marker (pilish--tool-block-end-marker block) nil)
+  (pilish--tool-block-unregister block)
+  (when (eq pilish--pending-tool-overlay (pilish--tool-block-overlay block))
+    (setq pilish--pending-tool-overlay nil))
+  nil)
+
+(defun pilish--release-nested-tool-state (&optional keep-text)
+  "Release retained execution routing and payloads at a teardown boundary.
+With KEEP-TEXT, mark pending or still-running calls unfinished and freeze the
+body before releasing payloads.  Idempotent; never a turn-settlement cleanup."
+  (pilish--cancel-tool-cooling)
+  (pilish--cancel-tool-update-flush)
+  (let ((blocks (when pilish--nested-tool-owners
+                  (delete-dups (hash-table-values pilish--nested-tool-owners)))))
+    ;; History has display identity but no runtime owners.  Release its hot
+    ;; snapshots at the same teardown boundary, before their overlays vanish.
+    (dolist (overlay (pilish--tool-block-overlays-in-region (point-min) (point-max)))
+      (when-let* ((block (pilish--tool-block-from-overlay overlay))
+                  ((pilish--tool-block-compound-p block)))
+        (cl-pushnew block blocks)))
+    (dolist (block blocks)
+      (let ((overlay (pilish--tool-block-overlay block)))
+        (if (and keep-text (eq (overlay-buffer overlay) (current-buffer)))
+            (progn
+              (dolist (call (pilish--tool-block-nested-calls block))
+                (when (or (pilish--nested-call-pending-end-p call)
+                          (eq (pilish--nested-call-status call) 'running))
+                  (setf (pilish--nested-call-status call) 'unfinished
+                        (pilish--nested-call-pending-end-p call) nil)))
+              (pilish--redraw-compound-tool block)
+              (pilish--tool-block-finalize block (overlay-get overlay 'face))
+              (pilish--cool-tool-overlay-preserving-view overlay))
+          (pilish--release-nested-tool-block block))))
+    (when pilish--nested-tool-owners
+      (clrhash pilish--nested-tool-owners)))
+  nil)
+
+(defun pilish--tool-block-execution-backed-p (block)
+  "Return non-nil when BLOCK represents execution rather than a pure preview."
+  (and block
+       (or (pilish--tool-block-execution-start block)
+           (and (pilish--tool-block-compound-p block)
+                (or (pilish--tool-block-result block)
+                    (pilish--tool-block-nested-calls block))))))
 
 (defun pilish--ensure-live-tool-blocks ()
   "Return the live tool block registry for the current buffer."
@@ -1977,9 +2669,10 @@ needed for compatibility, the current non-keyed pending block."
       (pilish--tool-block-apply-hover block)))
   block)
 
-(defun pilish--tool-block-set-execution-start (block time)
-  "Store local execution-start TIME on BLOCK, not its earlier preview."
-  (setf (pilish--tool-block-execution-start block) time))
+(defun pilish--tool-block-set-execution-start (block time args)
+  "Store execution-start TIME and authoritative ARGS on BLOCK, not its preview."
+  (setf (pilish--tool-block-execution-start block) time
+        (pilish--tool-block-args block) args))
 
 (defun pilish--tool-block-apply-hover (block)
   "Apply BLOCK's completed help to its current text, below specific UI help."
@@ -2187,8 +2880,9 @@ absent or previously owned help.  Links, images and buttons keep precedence."
 (defun pilish--fontify-with-hover-help (function start end &rest args)
   "Fontify START..END with FUNCTION and ARGS, letting native help win.
 Mask fallback at the native unfontification seam: its bounds already include
-line/multiline expansion, unlike the original fontification request.  Restore
-cached fallback after native links have supplied their more-specific help."
+line/multiline expansion, unlike the original fontification request.  Repair
+literal metadata in the actual fontified bounds, then restore cached
+fallback after native links have supplied their more-specific help."
   (let ((unfontify font-lock-unfontify-region-function)
         ranges)
     (let ((font-lock-unfontify-region-function
@@ -2209,7 +2903,14 @@ cached fallback after native links have supplied their more-specific help."
              (funcall unfontify beg end))))
       (with-silent-modifications
         (unwind-protect
-            (apply function start end args)
+            (let ((result (apply function start end args)))
+              (save-restriction
+                (widen)
+                (pcase result
+                  (`(jit-lock-bounds ,beg . ,end)
+                   (pilish--restore-tool-properties beg end))
+                  (_ (pilish--restore-tool-properties start end))))
+              result)
           (save-restriction
             (widen)
             (dolist (range ranges)
@@ -2659,6 +3360,9 @@ until an authoritative tool execution/history event supplies it."
     ;; Forced finalization is not an observed execution end.  Only the event
     ;; handler may calculate a duration, before this boundary is discarded.
     (setf (pilish--tool-block-execution-start block) nil)
+    (unless (pilish--tool-block-compound-p block)
+      (setf (pilish--tool-block-args block) nil
+            (pilish--tool-block-result block) nil))
     (overlay-put ov 'face face)
     (pilish--tool-block-refresh-overlay block)
     (pilish--tool-block-unregister block)
@@ -2667,8 +3371,10 @@ until an authoritative tool execution/history event supplies it."
   block)
 
 (defun pilish--tool-block-delete (block)
-  "Delete BLOCK's text and overlay, then remove it from live state."
+  "Delete pure preview BLOCK's text and overlay, then remove it from live state.
+Execution-backed blocks must survive preview reconciliation."
   (when-let* ((block block)
+              ((not (pilish--tool-block-execution-backed-p block)))
               (ov (pilish--tool-block-overlay block))
               (start (overlay-start ov))
               (end (overlay-end ov)))
@@ -2702,7 +3408,9 @@ until an authoritative tool execution/history event supplies it."
         (setq pilish--pending-tool-overlay nil)
         (when-let* ((last-block (car (last (pilish--live-tool-blocks-in-order)))))
           (setq pilish--pending-tool-overlay
-                (pilish--tool-block-overlay last-block))))))
+                (pilish--tool-block-overlay last-block))))
+      (when (pilish--tool-block-compound-p block)
+        (pilish--release-nested-tool-block block))))
   nil)
 
 (defun pilish--tool-overlay-finalize (face &optional block)
@@ -2804,7 +3512,12 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
               (ov (pilish--tool-block-overlay block))
               (ov-start (overlay-start ov))
               (header-end (pilish--tool-block-header-end block)))
-    (let ((new-header (pilish--tool-header tool-name args preview-state))
+    (let ((new-header (pilish--tool-header
+                       tool-name args
+                       (if (and (pilish--tool-block-compound-p block)
+                                (equal tool-name "codemode"))
+                           'streaming
+                         preview-state)))
           (header-limit (1- (marker-position header-end))))
       (when (<= ov-start header-limit)
         (let ((old-header (buffer-substring-no-properties ov-start header-limit)))
@@ -3235,12 +3948,14 @@ Suspend expensive md-ts hooks for immediate starts as well as queued paints."
 (defun pilish--tool-block-rekey (block tool-call-id)
   "Change live BLOCK's registry key to authoritative TOOL-CALL-ID."
   (when (and block (pilish--tool-call-id-p tool-call-id))
-    (let ((changed
-           (not (equal (pilish--tool-block-tool-call-id block)
-                       tool-call-id))))
+    (let* ((old-id (pilish--tool-block-tool-call-id block))
+           (changed (not (equal old-id tool-call-id)))
+           (owner-p (eq block (pilish--nested-tool-owner old-id))))
       (when changed
         (pilish--tool-block-unregister block)
-        (setf (pilish--tool-block-tool-call-id block) tool-call-id))
+        (when owner-p (remhash old-id pilish--nested-tool-owners))
+        (setf (pilish--tool-block-tool-call-id block) tool-call-id)
+        (when owner-p (puthash tool-call-id block pilish--nested-tool-owners)))
       ;; Registration may have been displaced by a colliding provisional ID.
       (pilish--tool-block-register block)
       (when changed
@@ -3255,15 +3970,20 @@ Suspend expensive md-ts hooks for immediate starts as well as queued paints."
     (let* ((tool-call-id (plist-get tool-call :id))
            (tool-name (plist-get tool-call :name))
            (args (plist-get tool-call :arguments))
-           ;; Content index owns a generation stream.  If that stream has not
-           ;; rendered yet (as in tagged Pi 0.84.2), create its block rather than
-           ;; adopting another stream's colliding authoritative ID.
-           (block (if stream
-                      (or (pilish--tool-stream-block stream)
-                          (pilish--display-tool-start
-                           tool-name args nil content-index nil 'defer))
-                    (pilish--tool-block-get tool-call-id))))
-      (when block
+           (keyed-block (or (pilish--tool-block-get tool-call-id)
+                            (pilish--nested-tool-owner tool-call-id)))
+           ;; Execution identity is no longer a preview.  Otherwise content
+           ;; index owns generation, including colliding provisional IDs.
+           (block (if (pilish--tool-block-execution-backed-p keyed-block)
+                      keyed-block
+                    (if stream
+                        (or (pilish--tool-stream-block stream)
+                            (pilish--display-tool-start
+                             tool-name args nil content-index nil 'defer))
+                      keyed-block))))
+      (when (and stream (not (eq block (pilish--tool-stream-block stream))))
+        (pilish--tool-block-delete (pilish--tool-stream-block stream)))
+      (when (and block (not (pilish--tool-block-execution-backed-p block)))
         (pilish--tool-block-rekey block tool-call-id))
       (setq block
             (pilish--reconcile-toolcall-preview-block
@@ -3338,9 +4058,10 @@ Each element is a plist `(:content-index N :tool-call TOOL-CALL)'."
     (nreverse tool-calls)))
 
 (defun pilish--clear-toolcall-preview-body (block)
-  "Clear stale streamed body state from tool preview BLOCK."
-  (pilish--tool-block-set-last-tail block nil)
-  (pilish--tool-block-replace-body block "" nil nil))
+  "Clear stale streamed body state from unexecuted tool preview BLOCK."
+  (unless (pilish--tool-block-execution-backed-p block)
+    (pilish--tool-block-set-last-tail block nil)
+    (pilish--tool-block-replace-body block "" nil nil)))
 
 (defun pilish--reconcile-toolcall-preview-block
     (content-index tool-call &optional event-type block)
@@ -3351,43 +4072,60 @@ nil, reuse a keyed block or create one."
          (tool-name (plist-get tool-call :name))
          (args (plist-get tool-call :arguments))
          (streaming-p (member event-type '("toolcall_start" "toolcall_delta")))
+         (compound-redraw-p (and (equal tool-name "codemode") (not streaming-p)))
          (preview-state (and streaming-p 'streaming))
          (existing-block (or block
-                             (pilish--tool-block-get tool-call-id)))
+                             (pilish--tool-block-get tool-call-id)
+                             (pilish--nested-tool-owner tool-call-id)))
          (block (or existing-block
                     (pilish--display-tool-start
                      tool-name args tool-call-id content-index preview-state
                      'defer))))
-    (setq pilish--pending-tool-overlay
-          (pilish--tool-block-overlay block))
-    (overlay-put (pilish--tool-block-overlay block)
-                 'pilish-tool-name tool-name)
-    (when existing-block
-      (pilish--display-tool-update-header
-       tool-name args block preview-state))
-    (let ((content (pilish--tool-arg-get args :content)))
-      (cond
-       ((equal event-type "toolcall_end")
-        (if (and (equal tool-name "write") (stringp content))
-            (pilish--display-tool-streaming-text
-             content
-             pilish-tool-preview-lines
-             (pilish--path-to-language
-              (pilish--tool-path-string
-               (pilish--tool-arg-path args)))
-             block)
-          (pilish--clear-toolcall-preview-body block)))
-       ((and (equal tool-name "write")
-             (pilish--tool-arg-member args :content))
-        (if (stringp content)
-            (pilish--display-tool-streaming-text
-             content
-             pilish-tool-preview-lines
-             (pilish--path-to-language
-              (pilish--tool-path-string
-               (pilish--tool-arg-path args)))
-             block)
-          (pilish--clear-toolcall-preview-body block)))))
+    (unless (pilish--tool-block-execution-backed-p block)
+      (when (and (pilish--tool-block-compound-p block) (not compound-redraw-p))
+        ;; Ordinary authority supersedes generation-only compound state,
+        ;; not observed execution facts or retained descendant obligations.
+        (setf (pilish--tool-block-compound-p block) nil
+              (pilish--tool-block-args block) nil
+              (pilish--tool-block-folds block) nil)
+        (pilish--tool-block-set-last-tail block nil)
+        (remhash (pilish--tool-block-tool-call-id block) pilish--nested-tool-owners))
+      (setq pilish--pending-tool-overlay
+            (pilish--tool-block-overlay block))
+      (overlay-put (pilish--tool-block-overlay block)
+                   'pilish-tool-name tool-name)
+      (when existing-block
+        (pilish--display-tool-update-header
+         tool-name args block preview-state))
+      (let ((content (pilish--tool-arg-get args :content)))
+        (cond
+         ((equal event-type "toolcall_end")
+          (if (and (equal tool-name "write") (stringp content))
+              (pilish--display-tool-streaming-text
+               content
+               pilish-tool-preview-lines
+               (pilish--path-to-language
+                (pilish--tool-path-string
+                 (pilish--tool-arg-path args)))
+               block)
+            ;; Capture established compound sections before replacing them.
+            (unless compound-redraw-p
+              (pilish--clear-toolcall-preview-body block))))
+         ((and (equal tool-name "write")
+               (pilish--tool-arg-member args :content))
+          (if (stringp content)
+              (pilish--display-tool-streaming-text
+               content
+               pilish-tool-preview-lines
+               (pilish--path-to-language
+                (pilish--tool-path-string
+                 (pilish--tool-arg-path args)))
+               block)
+            (pilish--clear-toolcall-preview-body block))))))
+    (when compound-redraw-p
+      (pilish--enable-compound-tool block args)
+      (pilish--display-tool-update-header tool-name args block)
+      (pilish--redraw-compound-tool block))
     block))
 
 (defun pilish--prune-stale-toolcall-previews (tool-call-ids)
@@ -3673,12 +4411,6 @@ a minimum render interval; 250 ms is this frontend's humane cadence for
 previews that an authoritative tool_execution_end always supersedes.
 Internal constant, not a user option.")
 
-(defvar-local pilish--pending-tool-updates nil
-  "Alist of (TOOL-CALL-ID . PARTIAL-RESULT) awaiting coalesced rendering.
-Only the latest partial result per tool call is kept; superseded snapshots
-are dropped.  New entries are pushed, so flushing iterates the reversed
-alist to render first-queued-first.")
-
 (defvar-local pilish--tool-update-flush-timer nil
   "The one pending one-shot flush timer for tool updates, or nil.
 At most one timer exists per chat buffer; updates never cancel or rearm
@@ -3692,10 +4424,16 @@ it.  Only the flush itself schedules a further attempt (typing-wins).")
                      (current-buffer))))
 
 (defun pilish--queue-tool-update (tool-call-id partial-result)
-  "Record PARTIAL-RESULT as the pending preview for TOOL-CALL-ID.
-Latest-wins per tool call; the shared flush timer is armed only when none
+  "Record PARTIAL-RESULT as the pending paint for TOOL-CALL-ID.
+PARTIAL-RESULT is an ordinary result plist or an ingested compound block.
+Latest-wins per owner; the shared flush timer is armed only when none
 is pending, and an armed timer keeps its deadline.  No chat text changes."
   (when (and tool-call-id partial-result)
+    ;; A live ordinary tool can become compound before its first paint.  Its
+    ;; transient parent snapshot must already exist when a child is ingested.
+    (unless (pilish--tool-block-p partial-result)
+      (when-let* ((block (pilish--tool-block-get tool-call-id)))
+        (setf (pilish--tool-block-result block) partial-result)))
     (if-let* ((entry (assoc tool-call-id pilish--pending-tool-updates)))
         (setcdr entry partial-result)
       (push (cons tool-call-id partial-result)
@@ -3720,11 +4458,16 @@ before any preview is painted."
         (let ((pending (nreverse pilish--pending-tool-updates)))
           (setq pilish--pending-tool-updates nil)
           (dolist (entry pending)
-            (pilish--display-tool-update
-             (cdr entry)
-             ;; Falls back to the compatibility block when the tool call
-             ;; has no keyed live block.
-             (pilish--tool-block-get (car entry)))))))))
+            (let ((value (cdr entry)))
+              (if (pilish--tool-block-p value)
+                  (when (and (eq value (pilish--nested-tool-owner (car entry)))
+                             (eq (overlay-buffer (pilish--tool-block-overlay value))
+                                 (current-buffer)))
+                    (pilish--redraw-compound-tool value))
+                (pilish--display-tool-update
+                 value
+                 ;; Falls back to the compatibility block on an ordinary miss.
+                 (pilish--tool-block-get (car entry)))))))))))
 
 (defun pilish--discard-pending-tool-update (tool-call-id)
   "Drop any pending preview for TOOL-CALL-ID.
@@ -3738,9 +4481,9 @@ empty) pending map, and flushing nothing is a no-op."
 
 (defun pilish--cancel-tool-update-flush ()
   "Cancel any armed tool-update flush timer and discard pending previews.
-Idempotent.  Runs on agent_end and wherever live tool state is torn
-down -- buffer kill, session reset, history rebuild -- so no stale
-timer or preview survives a session transition."
+Idempotent.  Runs wherever live tool state is torn down -- buffer kill,
+session reset, history rebuild -- so no stale timer or preview survives a
+session transition.  Agent end preserves compound paints."
   (when (timerp pilish--tool-update-flush-timer)
     (cancel-timer pilish--tool-update-flush-timer))
   (setq pilish--tool-update-flush-timer nil
@@ -3750,13 +4493,27 @@ timer or preview survives a session transition."
   "Display PARTIAL-RESULT as streaming output in BLOCK.
 When BLOCK is nil, fall back to the current compatibility tool block.
 PARTIAL-RESULT has the same structure as a tool result plist with
-`:content'.  Extracts text from content blocks and delegates to
-`pilish--display-tool-streaming-text'."
+`:content'.  Ordinary output delegates to `pilish--display-tool-streaming-text'.
+Compound output retains parent facts and queues the owner for one repaint."
   (when partial-result
-    (let* ((content-blocks (plist-get partial-result :content))
-           (raw-output (pilish--extract-text-from-content content-blocks)))
-      (pilish--display-tool-streaming-text
-       raw-output pilish-bash-preview-lines nil block))))
+    (when block
+      (when (and (pilish--tool-block-compound-p block)
+                 (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name) "codemode")
+                 (equal (plist-get partial-result :content) [])
+                 (plist-member partial-result :details))
+        (setq partial-result
+              (plist-put (copy-sequence partial-result) :content
+                         (plist-get (pilish--tool-block-result block) :content))))
+      (setf (pilish--tool-block-result block) partial-result))
+    (if (and block (pilish--tool-block-compound-p block))
+        (progn
+          (pilish--merge-codemode-calls block (pilish--tool-arg-get
+                                             (plist-get partial-result :details) :calls))
+          (pilish--queue-tool-update (pilish--tool-block-tool-call-id block) block))
+      (let* ((content-blocks (plist-get partial-result :content))
+             (raw-output (pilish--extract-text-from-content content-blocks)))
+        (pilish--display-tool-streaming-text
+         raw-output pilish-bash-preview-lines nil block)))))
 
 (defun pilish--markdown-fence-delimiter (content)
   "Return a markdown fence delimiter safe for CONTENT.
@@ -3780,6 +4537,43 @@ Returns markdown string for syntax highlighting."
   (let ((fence (pilish--markdown-fence-delimiter content)))
     (format "%s%s\n%s\n%s" fence (or lang "") content fence)))
 
+(defun pilish--tool-result-presentation
+    (tool-name args content details is-error &optional omit-image-preparation)
+  "Select TOOL-NAME's result presentation from ARGS, CONTENT and DETAILS.
+IS-ERROR gates success-only diff annotations and SVG previews.  Insertion
+stays in the destination buffer so image properties and diff overlays survive.
+OMIT-IMAGE-PREPARATION skips image decoding and SVG scans for closed children.
+Text selection is unchanged; :images remains a list of prepared previews,
+and :image-content-p reports cheap image-block presence in CONTENT."
+  (let* ((is-error (eq t is-error))
+         (content-blocks (pilish--content-block-list content))
+         (text-blocks (seq-filter (lambda (c) (equal (plist-get c :type) "text"))
+                                  content-blocks))
+         (raw-output (mapconcat (lambda (c)
+                                  (pilish--render-safe-string (plist-get c :text)))
+                                text-blocks "\n"))
+         (images (unless omit-image-preparation
+                   (pilish--content-image-previews content-blocks)))
+         (svg-preview (and (not omit-image-preparation) (null images)
+                           (pilish--read-svg-preview tool-name args raw-output details is-error)))
+         (edit-diff (and (equal tool-name "edit") (pilish--tool-arg-get details :diff))))
+    (list :text
+          (ansi-color-filter-apply
+           (pilish--render-safe-string
+            (pcase tool-name
+              ("edit" (or edit-diff raw-output))
+              ("write" (or (pilish--tool-arg-get args :content) raw-output))
+              ((or "bash" "read") raw-output)
+              (_ (if-let* ((details-json (pilish--pretty-print-json details)))
+                     (concat raw-output "\n\n" (pilish--propertize-details-region details-json))
+                   raw-output)))))
+          :lang (pilish--path-to-language (pilish--tool-path-string (pilish--tool-arg-path args)))
+          :is-edit-diff (and (not is-error) (stringp edit-diff))
+          :images (if svg-preview (list svg-preview) images)
+          :image-content-p (pilish--content-has-image-p content-blocks)
+          :preview-limit (if (equal tool-name "bash") pilish-bash-preview-lines pilish-tool-preview-lines)
+          :offset (and (equal tool-name "read") (pilish--tool-arg-get args :offset)))))
+
 (defun pilish--display-tool-end
     (tool-name args content details is-error &optional block)
   "Display result for TOOL-NAME and finalize BLOCK.
@@ -3791,103 +4585,63 @@ When BLOCK is nil, fall back to the current compatibility tool block and,
 if none exists, render the result at point without a live overlay."
   (let* ((block (or block (pilish--current-tool-block)))
          (is-error (eq t is-error))
-         (content-blocks (pilish--content-block-list content))
-         (text-blocks (seq-filter (lambda (c) (equal (plist-get c :type) "text"))
-                                  content-blocks))
-         (raw-output (mapconcat (lambda (c)
-                                  (pilish--render-safe-string
-                                   (plist-get c :text)))
-                                text-blocks "\n"))
-         (content-image-previews
-          (pilish--content-image-previews content-blocks))
-         (svg-preview
-          (and (null content-image-previews)
-               (pilish--read-svg-preview
-                tool-name args raw-output details is-error)))
-         (image-previews
-          (if svg-preview (list svg-preview) content-image-previews))
-         ;; Determine language for syntax highlighting
-         (lang (pilish--path-to-language
-                (pilish--tool-path-string
-                 (pilish--tool-arg-path args))))
-         (edit-diff (and (equal tool-name "edit")
-                         (pilish--tool-arg-get details :diff)))
-         ;; For edit tool with a string diff, we'll apply diff overlays after insertion.
-         (is-edit-diff (and (not is-error)
-                            (stringp edit-diff)))
-         (display-content
-          (ansi-color-filter-apply
-           (pilish--render-safe-string
-            (pcase tool-name
-              ("edit" (or edit-diff raw-output))
-              ("write" (or (pilish--tool-arg-get args :content)
-                           raw-output))
-              ((or "bash" "read") raw-output)
-              (_ (if-let* ((details-json
-                           (pilish--pretty-print-json details)))
-                     (concat raw-output "\n\n"
-                             (pilish--propertize-details-region
-                              details-json))
-                   raw-output))))))
-         (preview-limit (pcase tool-name
-                          ("bash" pilish-bash-preview-lines)
-                          (_ pilish-tool-preview-lines)))
-         ;; Use visual line truncation with byte limit
-         (width (pilish--chat-display-width))
-         (truncation (pilish--truncate-to-visual-lines
-                      display-content preview-limit width))
-         (hidden-count (plist-get truncation :hidden-lines))
-         (needs-collapse (> hidden-count 0))
          (inhibit-read-only t))
-    (pilish--with-scroll-preservation
-      (save-excursion
-        (if block
-            (let* ((header-end (pilish--tool-block-header-end block))
-                   (end-marker (pilish--tool-block-end-marker block)))
-              (goto-char (marker-position header-end))
-              (delete-region (marker-position header-end)
-                             (marker-position end-marker))
+    (if (and block (pilish--tool-block-compound-p block))
+        (progn
+          (setf (pilish--tool-block-result block)
+                (list :content content :details details :isError is-error))
+          (pilish--merge-codemode-calls block (pilish--tool-arg-get details :calls)
+                                       (pilish--tool-block-history-p block))
+          (pilish--redraw-compound-tool block)
+          (pilish--tool-overlay-finalize
+           (if is-error 'pilish-tool-block-error 'pilish-tool-block) block))
+      (let* ((presentation (pilish--tool-result-presentation tool-name args content details is-error))
+             (image-previews (plist-get presentation :images))
+             (lang (plist-get presentation :lang))
+             (is-edit-diff (plist-get presentation :is-edit-diff))
+             (display-content (plist-get presentation :text))
+             (truncation (pilish--truncate-to-visual-lines
+                          display-content (plist-get presentation :preview-limit)
+                          (pilish--chat-display-width)))
+             (hidden-count (plist-get truncation :hidden-lines))
+             (needs-collapse (> hidden-count 0)))
+        (pilish--with-scroll-preservation
+          (save-excursion
+            (if block
+                (let* ((header-end (pilish--tool-block-header-end block))
+                       (end-marker (pilish--tool-block-end-marker block)))
+                  (goto-char (marker-position header-end))
+                  (delete-region (marker-position header-end)
+                                 (marker-position end-marker))
+                  (if needs-collapse
+                      ;; Long output: show preview with toggle button.
+                      (let ((preview-content (plist-get truncation :content)))
+                        (pilish--insert-tool-content-with-toggle
+                         preview-content display-content lang is-edit-diff hidden-count nil))
+                    ;; Short output: show all without toggle.
+                    (pilish--insert-rendered-tool-content
+                     (string-trim-right display-content "\n+") lang is-edit-diff))
+                  (pilish--insert-image-previews image-previews)
+                  (pilish--tool-block-set-image-previews block image-previews)
+                  (set-marker end-marker (point))
+                  (pilish--tool-block-refresh-overlay block)
+                  ;; Error content and the overlay face suffice; no error badge.
+                  (when-let* ((offset (plist-get presentation :offset)))
+                    (pilish--tool-block-set-offset block offset))
+                  (when-let* ((line-map (plist-get truncation :line-map)))
+                    (pilish--tool-block-set-line-map block line-map))
+                  (pilish--tool-overlay-finalize
+                   (if is-error 'pilish-tool-block-error 'pilish-tool-block) block)
+                  (when (eobp) (insert "\n")))
+              (goto-char (point-max))
               (if needs-collapse
-                  ;; Long output: show preview with toggle button.
                   (let ((preview-content (plist-get truncation :content)))
                     (pilish--insert-tool-content-with-toggle
                      preview-content display-content lang is-edit-diff hidden-count nil))
-                ;; Short output: show all without toggle.
                 (pilish--insert-rendered-tool-content
-                 (string-trim-right display-content "\n+")
-                 lang
-                 is-edit-diff))
+                 (string-trim-right display-content "\n+") lang is-edit-diff))
               (pilish--insert-image-previews image-previews)
-              (pilish--tool-block-set-image-previews
-               block image-previews)
-              (set-marker end-marker (point))
-              (pilish--tool-block-refresh-overlay block)
-              ;; Note: no [error] badge — error content in the block is sufficient,
-              ;; and the overlay face already shifts to pilish-tool-block-error.
-              (when (and (equal tool-name "read")
-                         (pilish--tool-arg-get args :offset))
-                (pilish--tool-block-set-offset
-                 block (pilish--tool-arg-get args :offset)))
-              (when-let* ((line-map (plist-get truncation :line-map)))
-                (pilish--tool-block-set-line-map block line-map))
-              (pilish--tool-overlay-finalize
-               (if is-error 'pilish-tool-block-error
-                 'pilish-tool-block)
-               block)
-              (when (eobp)
-                (insert "\n")))
-          (progn
-            (goto-char (point-max))
-            (if needs-collapse
-                (let ((preview-content (plist-get truncation :content)))
-                  (pilish--insert-tool-content-with-toggle
-                   preview-content display-content lang is-edit-diff hidden-count nil))
-              (pilish--insert-rendered-tool-content
-               (string-trim-right display-content "\n+")
-               lang
-               is-edit-diff))
-            (pilish--insert-image-previews image-previews)
-            (insert "\n")))))))
+              (insert "\n"))))))))
 
 (defun pilish--ranges-excluding-property (start end prop)
   "Return contiguous ranges in START..END where PROP is nil."
@@ -4267,14 +5021,15 @@ Returns (START . END) if inside a tool block, nil otherwise."
     (when-let* ((ov (seq-find (lambda (o) (overlay-get o 'pilish-tool-block)) overlays)))
       (cons (overlay-start ov) (overlay-end ov)))))
 
-(defun pilish--find-toggle-button-in-region (start end)
-  "Find a toggle button between START and END."
+(defun pilish--find-toggle-button-in-region (start end &optional section)
+  "Find a toggle button between START and END, optionally for SECTION."
   (save-excursion
     (goto-char start)
     (let ((found nil))
       (while (and (not found) (< (point) end))
         (let ((btn (button-at (point))))
-          (if (and btn (button-get btn 'pilish-full-content))
+          (if (and btn (button-get btn 'pilish-tool-toggle)
+                   (or (null section) (equal section (button-get btn 'pilish-tool-section))))
               (setq found btn)
             (forward-char 1))))
       found)))
@@ -4289,18 +5044,25 @@ folding."
     (unless (pilish--toggle-thinking-block-at-point)
       (let ((original-pos (point)))
         (if-let* ((bounds (pilish--find-tool-block-bounds)))
-            (if-let* ((btn (pilish--find-toggle-button-in-region
-                            (car bounds) (cdr bounds))))
-                (progn
-                  (pilish--toggle-tool-output btn)
-                  ;; Try to restore position, clamped to new block bounds.
-                  ;; Use (1- end) because overlays-at uses half-open [start, end),
-                  ;; so clamping to exactly end would place cursor outside the
-                  ;; overlay, breaking the next toggle.
-                  (when-let* ((new-bounds (pilish--find-tool-block-bounds)))
-                    (goto-char (min original-pos (1- (cdr new-bounds))))))
-              ;; No button found - short output, use outline-cycle
-              (outline-cycle))
+            (if-let* ((overlay (pilish--tool-overlay-at-point))
+                      (block (pilish--tool-block-from-overlay overlay))
+                      ((pilish--tool-block-compound-p block)))
+                (let ((section (or (get-text-property (point) 'pilish-tool-section)
+                                   (and (pilish--compound-tool-code block) 'script)
+                                   (and (pilish--tool-block-nested-calls block) 'children)
+                                   'output)))
+                  (when-let* ((button (pilish--find-toggle-button-in-region
+                                      (car bounds) (cdr bounds) section)))
+                    (button-activate button)))
+              (if-let* ((btn (pilish--find-toggle-button-in-region
+                              (car bounds) (cdr bounds))))
+                  (progn
+                    (pilish--toggle-tool-output btn)
+                    ;; Overlays use half-open bounds; keep point inside them.
+                    (when-let* ((new-bounds (pilish--find-tool-block-bounds)))
+                      (goto-char (min original-pos (1- (cdr new-bounds))))))
+                ;; No button found - short ordinary output, use outline-cycle.
+                (outline-cycle)))
           ;; Not in a tool block
           (outline-cycle))))))
 
@@ -4356,6 +5118,8 @@ Live tool blocks that are still executing are excluded."
        (overlay-get overlay 'pilish-tool-block)
        (not (eq overlay pilish--pending-tool-overlay))
        (not (pilish--tool-overlay-live-p overlay))
+       (not (pilish--nested-pending-p
+             (pilish--tool-block-from-overlay overlay)))
        (overlay-get overlay 'pilish-header-end)))
 
 (defun pilish--completed-tool-overlay-before-p (overlay boundary)
@@ -4388,6 +5152,28 @@ The result is ordered from the end of the buffer backward."
         (pilish--completed-tool-overlay-before-p overlay boundary))
       (overlays-in (point-min) boundary)))))
 
+(defun pilish--tool-fenced-content-bounds (start end)
+  "Return the first tool wrapper's content bounds within START..END, or nil.
+Exclude the wrapper newline immediately before the closing fence."
+  (save-excursion
+    (goto-char start)
+    (when-let* ((opening-fence (pilish--fence-line-info-at-point)))
+      (forward-line 1)
+      (let ((content-start (point))
+            (closing-start nil))
+        (while (and (not closing-start) (< (point) end))
+          (let ((line-info (pilish--fence-line-info-at-point)))
+            (when (pilish--fence-closing-line-p opening-fence line-info)
+              (setq closing-start (line-beginning-position))))
+          (unless closing-start
+            (forward-line 1)))
+        (when closing-start
+          (cons content-start
+                (if (and (> closing-start content-start)
+                         (eq (char-before closing-start) ?\n))
+                    (1- closing-start)
+                  closing-start)))))))
+
 (defun pilish--tool-overlay-visible-body (overlay)
   "Return the currently visible body text for completed tool OVERLAY.
 Extracts the text between the outer fence lines, removing only the
@@ -4396,25 +5182,9 @@ therefore cool into their visible preview only."
   (when-let* ((header-end-marker (overlay-get overlay 'pilish-header-end))
               (header-end (and (markerp header-end-marker)
                                (marker-position header-end-marker)))
-              (overlay-end (overlay-end overlay)))
-    (save-excursion
-      (goto-char header-end)
-      (when-let* ((opening-fence (pilish--fence-line-info-at-point)))
-        (forward-line 1)
-        (let ((content-start (point))
-              (closing-start nil))
-          (while (and (not closing-start) (< (point) overlay-end))
-            (let ((line-info (pilish--fence-line-info-at-point)))
-              (when (pilish--fence-closing-line-p opening-fence line-info)
-                (setq closing-start (line-beginning-position))))
-            (unless closing-start
-              (forward-line 1)))
-          (when closing-start
-            (let ((wrapped-body (buffer-substring-no-properties
-                                 content-start closing-start)))
-              (if (string-suffix-p "\n" wrapped-body)
-                  (substring wrapped-body 0 -1)
-                wrapped-body))))))))
+              (overlay-end (overlay-end overlay))
+              (bounds (pilish--tool-fenced-content-bounds header-end overlay-end)))
+    (buffer-substring-no-properties (car bounds) (cdr bounds))))
 
 (defun pilish--cold-tool-target-metadata
     (overlay header-end collapsed)
@@ -4435,56 +5205,104 @@ buttons, full content, markers, and absolute buffer positions."
                          (overlay-get overlay 'pilish-line-map))
           :header-length (- header-end (overlay-start overlay)))))
 
+(defun pilish--compound-tool-cold-projection (overlay)
+  "Project OVERLAY's displayed body to inert, language-free text.
+Return :cold-body and transient absolute :deleted-spans for view mapping.
+Copy only lightweight section/summary properties and visible image previews;
+never select or truncate results again."
+  (let* ((start (marker-position (overlay-get overlay 'pilish-header-end)))
+         (end (overlay-end overlay))
+         (body (buffer-substring start end))
+         (cold (substring-no-properties body))
+         language-spans)
+    (dolist (property '(pilish-tool-section pilish-nested-summary pilish-nested-root-id
+                       pilish-nested-call-id pilish-nested-duration pilish-image-preview
+                       pilish-no-fontify))
+      (let ((position 0))
+        (while (< position (length body))
+          (let ((next (next-single-property-change position property body (length body)))
+                (value (get-text-property position property body)))
+            (when value (put-text-property position next property value cold))
+            (setq position next)))))
+    ;; Image placeholders keep the same graphical/terminal representation.
+    (let ((position 0))
+      (while (< position (length body))
+        (let ((next (next-single-property-change position 'pilish-image-preview body (length body))))
+          (when (get-text-property position 'pilish-image-preview body)
+            (dolist (property '(display face fontified rear-nonsticky help-echo))
+              (put-text-property position next property (get-text-property position property body) cold)))
+          (setq position next))))
+    (save-excursion
+      (goto-char start)
+      (let (fence)
+        (while (< (point) end)
+          (let ((info (pilish--fence-line-info-at-point)))
+            (cond
+             (fence (when (pilish--fence-closing-line-p fence info) (setq fence nil)))
+             (info
+              (setq fence info)
+              (let ((language-length (length (plist-get info :trailing))))
+                (when (> language-length 0)
+                  (push (cons (- (line-end-position) language-length start)
+                              (- (line-end-position) start)) language-spans))))))
+          (forward-line 1))))
+    ;; Spans are already in reverse order, so earlier offsets stay valid.
+    (dolist (span language-spans)
+      (setq cold (concat (substring cold 0 (car span)) (substring cold (cdr span)))))
+    (list :cold-body cold
+          :deleted-spans (mapcar (lambda (span)
+                                   (cons (+ start (car span)) (+ start (cdr span))))
+                                 language-spans))))
+
 (defun pilish--tool-overlay-cold-metadata (overlay)
   "Return cold-history metadata for completed tool OVERLAY.
 The result carries its visible body, lightweight target metadata and, for a
 currently collapsed block, its hidden count.  Expanded blocks return no hidden
-count because cold history must stay preview-only."
-  (when-let* ((visible-body (pilish--tool-overlay-visible-body overlay))
-              (header-end (marker-position
-                           (overlay-get overlay 'pilish-header-end))))
-    (let* ((record (pilish--tool-block-from-overlay overlay))
-           (image-previews
-            (and record
-                 (pilish--tool-block-image-previews record)))
-           (button (pilish--find-toggle-button-in-region
-                    header-end (overlay-end overlay)))
-           (collapsed (and button
-                           (not (button-get button
-                                            'pilish-expanded))))
-           (hidden-count (and collapsed
-                              (button-get button 'hidden-count))))
-      (list :visible-body visible-body
-            :image-previews image-previews
-            :target-metadata
-            (pilish--cold-tool-target-metadata
-             overlay header-end collapsed)
-            :hidden-count (and (integerp hidden-count)
-                               (> hidden-count 0)
-                               hidden-count)))))
+count because cold history must stay preview-only.  Compound blocks instead
+freeze their entire currently displayed body in :cold-body."
+  (if-let* ((block (pilish--tool-block-from-overlay overlay))
+            ((pilish--tool-block-compound-p block)))
+      (append (pilish--compound-tool-cold-projection overlay)
+              (list :target-metadata
+                    (pilish--cold-tool-target-metadata
+                     overlay (marker-position (pilish--tool-block-header-end block))
+                     (not (member 'output (pilish--tool-block-folds block))))))
+    (when-let* ((visible-body (pilish--tool-overlay-visible-body overlay))
+                (header-end (marker-position
+                             (overlay-get overlay 'pilish-header-end))))
+      (let* ((record (pilish--tool-block-from-overlay overlay))
+             (image-previews (and record (pilish--tool-block-image-previews record)))
+             (button (pilish--find-toggle-button-in-region header-end (overlay-end overlay)))
+             (collapsed (and button (not (button-get button 'pilish-expanded))))
+             (hidden-count (and collapsed (button-get button 'hidden-count))))
+        (list :visible-body visible-body
+              :image-previews image-previews
+              :target-metadata
+              (pilish--cold-tool-target-metadata overlay header-end collapsed)
+              :hidden-count (and (integerp hidden-count) (> hidden-count 0) hidden-count))))))
 
 (defun pilish--cool-tool-overlay (overlay)
   "Rewrite completed tool OVERLAY into its cold plain-history form.
 Preserves the header and visible preview, drops overlays, buttons, and
-diff annotations."
+diff annotations.  Return the applied projection metadata, or nil if ineligible."
   (when (pilish--completed-tool-overlay-p overlay)
     (when-let* ((metadata (pilish--tool-overlay-cold-metadata overlay))
-                (visible-body (plist-get metadata :visible-body))
                 (header-end (marker-position
                              (overlay-get overlay 'pilish-header-end))))
       (let* ((inhibit-read-only t)
              (hidden-count (plist-get metadata :hidden-count))
              (image-previews (plist-get metadata :image-previews))
              (target-metadata (plist-get metadata :target-metadata))
-             (cold-body (concat
-                         (pilish--wrap-in-src-block visible-body nil)
-                         "\n"
-                         (pilish--image-previews-text image-previews)
-                         (when hidden-count
-                           (concat (pilish--tool-hidden-line-label hidden-count)
-                                   "\n"))))
+             (cold-body (or (plist-get metadata :cold-body)
+                            (concat
+                             (pilish--wrap-in-src-block (plist-get metadata :visible-body) nil)
+                             "\n"
+                             (pilish--image-previews-text image-previews)
+                             (when hidden-count
+                               (concat (pilish--tool-hidden-line-label hidden-count) "\n")))))
              (ov-start (overlay-start overlay))
-             (ov-end (overlay-end overlay)))
+             (ov-end (overlay-end overlay))
+             (record (pilish--tool-block-from-overlay overlay)))
         (remove-overlays ov-start ov-end 'pilish-diff-overlay t)
         (remove-text-properties
          ov-start ov-end '(pilish-cold-tool-block nil))
@@ -4499,7 +5317,9 @@ diff annotations."
            `(pilish-cold-tool-block ,target-metadata))
           (when-let* ((help (plist-get target-metadata :help)))
             (pilish--set-hover-help ov-start (point) help)))
-        t))))
+        (when (and record (pilish--tool-block-compound-p record))
+          (pilish--release-nested-tool-block record))
+        metadata))))
 
 (defun pilish--cool-completed-tool-blocks (overlays)
   "Cool the given completed tool OVERLAYS.
@@ -4603,16 +5423,18 @@ the replacement."
     (get-buffer-window-list (current-buffer) nil t))))
 
 (defun pilish--restore-tool-cooling-view
-    (view old-start old-end new-end)
+    (view old-start old-end new-end &optional map-position)
   "Restore cooling VIEW through the body replacement bounds.
 OLD-START and OLD-END are the old body bounds and NEW-END is its new end.
 Every live window still showing the current buffer gets mapped start and point;
 a window that was following the tail instead gets point at the new buffer end.
-The buffer's own point is mapped too."
+The buffer's own point is mapped too.  Optional MAP-POSITION supplies a
+section-aware old-position to new-position mapping."
   (let ((map-position
-         (lambda (position)
-           (pilish--map-tool-cooling-position
-            position old-start old-end new-end))))
+         (or map-position
+             (lambda (position)
+               (pilish--map-tool-cooling-position
+                position old-start old-end new-end)))))
     ;; Restore buffer point first.  A selected chat window restored below then
     ;; establishes the same mapped point, or point-max when it was following.
     (goto-char (funcall map-position (plist-get view :point)))
@@ -4634,7 +5456,7 @@ The buffer's own point is mapped too."
 (defun pilish--cool-tool-overlay-preserving-view (overlay)
   "Cool completed tool OVERLAY while mapping visible view positions.
 The header stays in place, so only the replaced body bounds participate in the
-mapping.  Return the result of `pilish--cool-tool-overlay'."
+mapping.  Return non-nil when the rewrite succeeds."
   (let* ((header-end-marker
           (overlay-get overlay 'pilish-header-end))
          (old-start (and (markerp header-end-marker)
@@ -4648,9 +5470,17 @@ mapping.  Return the result of `pilish--cool-tool-overlay'."
             ;; across exactly the newly inserted body.
             (new-end-marker (copy-marker old-start t)))
         (unwind-protect
-            (when (pilish--cool-tool-overlay overlay)
-              (pilish--restore-tool-cooling-view
-               view old-start old-end (marker-position new-end-marker))
+            (when-let* ((metadata (pilish--cool-tool-overlay overlay)))
+              (let ((spans (plist-get metadata :deleted-spans)))
+                (pilish--restore-tool-cooling-view
+                 view old-start old-end (marker-position new-end-marker)
+                 (when spans
+                   (lambda (position)
+                     ;; Subtract only deleted characters before POSITION.
+                     ;; Positions inside a removed tag clamp to its start.
+                     (- position
+                        (cl-loop for (beg . end) in spans
+                                 sum (max 0 (- (min position end) beg))))))))
               t)
           (set-marker new-end-marker nil))))))
 
@@ -6665,19 +7495,26 @@ Return nil outside a cold tool.  Any chat restriction is restored exactly."
 (defun pilish--file-target-at-point ()
   "Return the file target at point, or nil.
 Resolution priority is authoritative hot/cold tool metadata, semantic Markdown
-link ownership, then strict visible text.  Invalid or absent tool metadata never
-falls through.  Semantic lookup is explicitly tri-state, so an owned non-file,
-reference, or malformed link also never falls through to a path-like label."
-  (if-let* ((overlay (pilish--tool-overlay-at-point)))
-      (pilish--tool-file-target overlay)
-    (if-let* ((cold-block (pilish--cold-tool-block-at-point)))
-        (pilish--cold-tool-file-target cold-block)
-      (pcase (pilish--semantic-link-file-target-at-point)
-        (`(:status :owned-valid :target ,target) target)
-        (`(:status :owned-invalid) nil)
-        (`(:status :not-a-link . ,properties)
-         (pilish--text-file-target-at-point
-          (plist-get properties :markdown-code-span)))))))
+link ownership, then strict visible text.  Generated startup banners without
+known source metadata have no file target.  Invalid or absent tool metadata
+never falls through.  Semantic lookup is explicitly tri-state, so an owned
+non-file, reference, or malformed link also never falls through to a path-like
+label.
+Child sections deliberately have no file-navigation authority."
+  (let ((section (get-text-property (point) 'pilish-tool-section)))
+    (unless (or (eq section 'children) (eq (car-safe section) 'child)
+                (and (get-text-property (point) 'pilish-startup-banner)
+                     (not (get-text-property (point) 'pilish-startup-source))))
+      (if-let* ((overlay (pilish--tool-overlay-at-point)))
+          (pilish--tool-file-target overlay)
+        (if-let* ((cold-block (pilish--cold-tool-block-at-point)))
+            (pilish--cold-tool-file-target cold-block)
+          (pcase (pilish--semantic-link-file-target-at-point)
+            (`(:status :owned-valid :target ,target) target)
+            (`(:status :owned-invalid) nil)
+            (`(:status :not-a-link . ,properties)
+             (pilish--text-file-target-at-point
+              (plist-get properties :markdown-code-span)))))))))
 
 (defconst pilish--shell-execution-buffer-variables
   '(process-environment exec-path shell-file-name shell-command-switch
@@ -7172,12 +8009,25 @@ Display-only table decoration is applied after the content is stable."
 ;;;; Tool Property Restoration
 
 (defun pilish--restore-tool-properties (beg end)
-  "Restore tool header faces after tree-sitter fontification in BEG..END.
-Tree-sitter markdown applies `invisible' and `face' properties to markup
-patterns in tool headers (for example, `$ echo **hello**').  This strips
-that markdown damage and restores the intended `font-lock-face' values for
-all overlapping tool headers, live or finalized."
-  (let ((inhibit-read-only t))
+  "Restore literal metadata after tree-sitter fontification in BEG..END.
+Strip Markdown hiding, faces and link buttons from saved assistant outcomes,
+child summaries and full-output paths, including cold text without overlays.
+Preserve image preview display properties and the outcome notice face.
+Restore `font-lock-face' values for all
+overlapping tool headers, live or finalized."
+  (let ((inhibit-read-only t)
+        (pos beg))
+    (while (< pos end)
+      (let ((limit (min (next-single-property-change pos 'pilish-nested-summary nil end)
+                        (next-single-property-change pos 'pilish-tool-section nil end)
+                        (next-single-property-change pos 'pilish-assistant-outcome nil end)))
+            (outcome (get-text-property pos 'pilish-assistant-outcome)))
+        (when (or outcome (get-text-property pos 'pilish-nested-summary)
+                  (eq (get-text-property pos 'pilish-tool-section) 'full-output))
+          (md-ts--remove-link-button-properties pos limit)
+          (remove-text-properties pos limit '(invisible nil display nil face nil))
+          (when outcome (put-text-property pos limit 'face 'pilish-error-notice)))
+        (setq pos limit)))
     (dolist (ov (pilish--tool-block-overlays-in-region beg end))
       (when-let* ((ov-start (overlay-start ov))
                   (ov-end (overlay-end ov))
@@ -7332,6 +8182,16 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
   (let* ((tool-name (plist-get tool-call :name))
          (args (plist-get tool-call :arguments))
          (block (pilish--display-tool-start tool-name args)))
+    ;; Display identity is not execution registration.  History rows have no
+    ;; runtime owner, owed end, or child result to replay.
+    (setf (pilish--tool-block-tool-call-id block) (plist-get tool-call :id)
+          (pilish--tool-block-args block) args
+          (pilish--tool-block-history-p block) t)
+    (pilish--merge-saved-nested-calls block (pilish--tool-arg-get result :nestedCalls))
+    (pilish--merge-codemode-calls
+     block (pilish--tool-arg-get (pilish--tool-arg-get result :details) :calls) t)
+    (when (pilish--tool-block-compound-p block)
+      (pilish--display-tool-update-header tool-name args block))
     (if result
         (pilish--display-tool-end
          tool-name args
@@ -7347,7 +8207,7 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
     (pilish--tool-block-apply-hover block)))
 
 (defun pilish--render-history-assistant-content (message results)
-  "Render assistant MESSAGE content blocks in source order.
+  "Render assistant MESSAGE content in order, followed by its saved outcome.
 RESULTS maps toolCallId strings to matching toolResult messages."
   (let ((content (plist-get message :content))
         (help (pilish--assistant-hover-help message))
@@ -7380,7 +8240,19 @@ RESULTS maps toolCallId strings to matching toolResult messages."
                (flush-text)
                (pilish--render-history-tool
                 block (gethash (plist-get block :id) results))))))
-        (flush-text))))))
+        (flush-text)))))
+  (when-let* ((label (pcase (plist-get message :stopReason)
+                      ("error" "Error")
+                      ("aborted" "Aborted"))))
+    (let ((explanation (plist-get message :errorMessage)))
+      (pilish--append-to-chat
+       (concat "\n"
+               (propertize (concat "[" label
+                                   (when (and (stringp explanation) (not (string-empty-p explanation)))
+                                     (concat ": " explanation))
+                                   "]")
+                           'face 'pilish-error-notice 'pilish-assistant-outcome t)
+               "\n")))))
 
 (defun pilish--rewrite-tail-window-p
     (window-point window-end point-max point-row body-height)

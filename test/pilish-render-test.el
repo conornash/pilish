@@ -1028,6 +1028,2518 @@ execution cannot retain a temporary record on this setup's evaluator stack."
           (pilish--unregister-display-handler proc)
           (delete-process proc))))))
 
+;;; Nested execution ownership and lifetime
+
+(defun pilish-test--nested-event (type id parent &rest properties)
+  "Send execution TYPE for ID with optional PARENT and PROPERTIES."
+  (pilish--handle-display-event
+   (append (list :type type :toolCallId id)
+           (when parent (list :parentToolCallId parent))
+           properties)))
+
+;;; Saved nested summaries share the live insertion renderer
+
+(defun pilish-test--nested-history-messages (&optional filename)
+  "Return raw message entries from golden FILENAME, without projection."
+  (vconcat
+   (seq-map (lambda (entry) (plist-get entry :message))
+            (seq-filter (lambda (entry) (equal (plist-get entry :type) "message"))
+                        (plist-get (pilish-jsonl-read-file
+                                    (expand-file-name (or filename "nested-tools-session.jsonl")
+                                                      pilish-test--fixture-dir))
+                                   :entries)))))
+
+(ert-deftest pilish-test-nested-history-matches-live-summary-grammar ()
+  "Completed live and saved facts have identical visible summary grammar."
+  ;; A separate history renderer or missing saved feeder loses summaries,
+  ;; alters their visible grammar, or invents expandable saved child output.
+  (let* ((messages (pilish-test--nested-history-messages))
+         (tool-call (aref (plist-get (aref messages 1) :content) 0))
+         (parent (aref messages 2))
+         (now 10)
+         completed-live-lines)
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (cl-letf (((symbol-function 'current-time) (lambda () (seconds-to-time now))))
+        (pilish-test--nested-event
+         "tool_execution_start" "p" nil :toolName "codemode" :args (plist-get tool-call :arguments))
+        (pilish-test--nested-event
+         "tool_execution_start" "p/1" "p" :toolName "read" :args '(:path "/tmp/CHILD-READ"))
+        (setq now 10.012)
+        (pilish-test--nested-event
+         "tool_execution_end" "p/1" "p" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "ACTUAL-READ-OUTPUT")]))
+        (should (equal (pilish-test--nested-summary-lines "p")
+                       '(("p/1" . "  ✓ read {\"path\":\"/tmp/CHILD-READ\"} 12ms"))))
+        (pilish-test--nested-event
+         "tool_execution_start" "p/2" "p" :toolName "bash"
+         :args (list :command (concat "printf 'CHILD-ERROR'; " (make-string 8964 ?x))))
+        (setq now 10.037)
+        (pilish-test--nested-event
+         "tool_execution_end" "p/2" "p" :toolName "bash" :isError t
+         :result '(:content [(:type "text" :text "Command exited with code 3")]))
+        (pilish-test--nested-event
+         "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+         :result (list :content (plist-get parent :content) :details (plist-get parent :details)))
+        (pilish--handle-display-event (list :type "message_end" :message parent))
+        (setq completed-live-lines (cl-subseq (pilish-test--nested-summary-lines "p" t) 0 2))
+        (pilish-test--nested-tab "p" '(child . "p/1"))
+        (should (string-match-p "ACTUAL-READ-OUTPUT" (buffer-string)))
+        (should-not (string-match-p "Child outputs are not saved" (buffer-string)))))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (pilish--display-history-messages messages)
+      (let ((completed-history-lines (seq-take (pilish-test--nested-summary-lines "p" t) 2)))
+        (should (equal completed-live-lines completed-history-lines)))
+      (should (equal (cdr (assoc "p/1" (pilish-test--nested-summary-lines "p")))
+                     "  ✓ read {\"path\":\"/tmp/CHILD-READ\"} 12ms"))
+      (should (equal (pilish-test--nested-summary-lines "g")
+                     '(("g/bridge" . "  ✓ bridge {\"tag\":\"child\"} 7ms")
+                       ("g/grandchild" . "  ✓ read {\"path\":\"grandchild.txt\"} 3ms"))))
+      (should-not (pilish--nested-tool-owner "g"))
+      (should-not (pilish--nested-tool-owner "g/grandchild"))
+      (should-not (string-match-p "ACTUAL-READ-OUTPUT" (buffer-string)))
+      (should-not (string-match-p (regexp-quote "[+ output]") (buffer-string)))
+      (should (string-match-p (regexp-quote "Child outputs are not saved in sessions.")
+                              (pilish--visible-text (point-min) (point-max)))))))
+
+(ert-deftest pilish-test-nested-history-live-result-message-enriches-without-regression ()
+  "A retained result gains saved facts in place without replaying event states."
+  ;; Dropping late result-message metadata loses arguments/timing.  Appending
+  ;; saved rows behind unmatched details changes saved order; replaying status
+  ;; replaces a received success or reopens its execution obligation.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let* ((messages (pilish-test--nested-history-messages))
+           (parent (aref messages 2))
+           (model (aref (plist-get (plist-get parent :details) :calls) 2)))
+      (pilish-test--nested-event
+       "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "text(1);"))
+      ;; End-without-start has no invented local duration or arguments.
+      (pilish-test--nested-event
+       "tool_execution_end" "p/1" "p" :toolName "read" :isError nil
+       :result '(:content [(:type "text" :text "EVENT-RESULT")]))
+      (pilish-test--nested-event
+       "tool_execution_end" "p/2" "p" :toolName "bash" :isError t
+       :result '(:content [(:type "text" :text "Command exited with code 3")]))
+      (pilish-test--nested-event
+       "tool_execution_end" "p" nil :toolName "codemode" :isError t
+       :result (list :content [(:type "text" :text "EVENT-PARENT-RESULT")]
+                     :details (list :calls (vector model))))
+      (let* ((root (pilish--nested-tool-owner "p"))
+             (overlay (pilish--tool-block-overlay root))
+             (event-result (pilish--nested-call-result (pilish--nested-call-get root "p/1"))))
+        (pilish--render-history-text "NEWER-TEXT")
+        (goto-char (point-min))
+        (search-forward "NEWER-TEXT")
+        (pilish--handle-display-event (list :type "message_end" :message parent))
+        (should (looking-back "NEWER-TEXT" (point-min)))
+        (should (eq overlay (car (pilish-test--all-tool-overlays))))
+        (should (equal (mapcar #'car (pilish-test--nested-summary-lines "p"))
+                       '("p/1" "p/2" "p/3" "p/models.classify/1")))
+        (should (equal (cdr (assoc "p/1" (pilish-test--nested-summary-lines "p")))
+                       "  ✓ read {\"path\":\"/tmp/CHILD-READ\"} 12ms"))
+        (should (eq event-result (pilish--nested-call-result (pilish--nested-call-get root "p/1"))))
+        (should (string-match-p "EVENT-PARENT-RESULT" (buffer-string)))
+        (should (eq t (plist-get (pilish--tool-block-result root) :isError)))
+        (should (<= (overlay-end overlay) (pilish-test--hover-pos "NEWER-TEXT")))
+        (let ((snapshot (copy-tree parent t)))
+          (setf (plist-get (aref (plist-get (plist-get snapshot :nestedCalls) :calls) 0) :status)
+                "unfinished")
+          (pilish--handle-display-event (list :type "message_end" :message snapshot)))
+        (should (eq 'ok (pilish--nested-call-status (pilish--nested-call-get root "p/1"))))
+        (should-not (pilish--nested-pending-p root))
+        (should (equal (cdr (assoc "p/3" (pilish-test--nested-summary-lines "p" t)))
+                       "  ? read {\"path\":\"CHILD-LATE\"} unfinished when saved"))
+        ;; A real event can promote a row known only from the snapshot.  The
+        ;; snapshot alone must not register that row or owe an execution end.
+        (should-not (pilish--nested-tool-owner "p/3"))
+        (pilish-test--nested-event
+         "tool_execution_start" "p/3" "p" :toolName "read" :args '(:path "CHILD-LATE"))
+        (should (equal (cdr (assoc "p/3" (pilish-test--nested-summary-lines "p" t)))
+                       "  … read {\"path\":\"CHILD-LATE\"}"))
+        (should (pilish--nested-pending-p root))
+        (pilish-test--nested-event
+         "tool_execution_end" "p/3" "p" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "PROMOTED-LIVE-OUTPUT")]))
+        (pilish--handle-display-event (list :type "message_end" :message parent))
+        (should (equal (cdr (assoc "p/3" (pilish-test--nested-summary-lines "p" t)))
+                       "  ✓ read {\"path\":\"CHILD-LATE\"}"))
+        (should-not (pilish--nested-pending-p root))
+        (pilish-test--nested-tab "p" '(child . "p/3"))
+        (should (string-match-p "PROMOTED-LIVE-OUTPUT" (buffer-string)))
+        (should (= 4 (length (pilish-test--nested-summary-lines "p"))))
+        ;; A real end carries no args.  Keep known saved arguments when no
+        ;; start was observed, just as missing local timing stays absent.
+        (let ((snapshot (copy-tree parent t)))
+          (setf (plist-get (plist-get snapshot :nestedCalls) :calls)
+                [(:id "snapshot-only" :name "read" :arguments (:path "KNOWN-SAVED-PATH")
+                  :status "unfinished")])
+          (pilish--handle-display-event (list :type "message_end" :message snapshot)))
+        (should-not (pilish--nested-tool-owner "snapshot-only"))
+        (should-not (pilish--nested-pending-p root))
+        (pilish-test--nested-event
+         "tool_execution_end" "snapshot-only" "p" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "END-ONLY-OUTPUT")]))
+        (should (equal (cdr (assoc "snapshot-only" (pilish-test--nested-summary-lines "p")))
+                       "  ✓ read {\"path\":\"KNOWN-SAVED-PATH\"}"))
+        (should (= 5 (length (pilish-test--nested-summary-lines "p"))))
+        (should (= 1 (length (pilish-test--all-tool-overlays))))
+        ;; A lookup miss, including after cooling/teardown, must not append.
+        (let ((before (buffer-string)))
+          (pilish--handle-display-event
+           '(:type "message_end" :message
+             (:role "toolResult" :toolCallId "unknown" :toolName "codemode"
+              :nestedCalls (:calls [(:id "unknown/1" :name "read" :status "ok")] :complete t))))
+          (should (equal before (buffer-string))))))))
+
+(ert-deftest pilish-test-nested-history-incomplete-causes-are-honest ()
+  "Each saved incompleteness cause is explicit without guessing missing counts."
+  ;; Truthiness mistakes suppress false/empty notices; inferring a call count
+  ;; from omitted arguments or model metadata makes a false persistence claim.
+  (dolist (variant
+           '(("all calls ok" (:calls [(:id "p/1" :name "read" :arguments (:path "ok") :status "ok")]
+                             :complete :false) t)
+             ("arguments omitted" (:calls [(:id "p/1" :name "bash" :argumentsBytes 9000 :status "ok")]
+                                   :complete :false) t)
+             ("unfinished" (:calls [(:id "p/1" :name "read" :arguments (:path "late")
+                                    :status "unfinished")] :complete :false) t)
+             ("empty incomplete" (:calls [] :complete :false) t)
+             ("complete" (:calls [(:id "p/1" :name "read" :arguments (:path "ok") :status "ok")]
+                          :complete t) nil)
+             ("complete absent" (:calls []) nil)
+             ("nestedCalls absent" nil nil)))
+    (ert-info ((car variant))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (let* ((messages (pilish-test--nested-history-messages))
+               (parent (copy-tree (aref messages 2) t)))
+          (setf (plist-get parent :nestedCalls) (cadr variant)
+                (plist-get parent :details)
+                '(:calls [(:id "p/1" :name "bash" :args "{\"command\":\"PREVIEW\"}" :status "ok")
+                           (:id "p/model" :name "models.classify" :args "classifier"
+                            :status "ok" :cost 0.002)]))
+          (pilish--display-history-messages (vector (aref messages 1) parent)))
+        (let ((text (pilish--visible-text (point-min) (point-max)))
+              (summaries (pilish-test--nested-summary-lines "p" t)))
+          (should (= (if (nth 2 variant) 1 0)
+                     (pilish-test--count-matches "Incomplete saved call summary" text)))
+          (should-not (string-match-p "[0-9]+ more calls not recorded" text))
+          (should-not (string-match-p "  … " text))
+          (when (equal (car variant) "arguments omitted")
+            (should (string-match-p (regexp-quote "saved arguments omitted (9000 bytes)") text))
+            (should (equal (cdr (assoc "p/1" summaries)) "  ✓ bash {\"command\":\"PREVIEW\"}")))
+          (when (equal (car variant) "unfinished")
+            (should (equal (cdr (assoc "p/1" summaries))
+                           "  ? read {\"path\":\"late\"} unfinished when saved")))
+          (should (equal (cdr (assoc "p/model" summaries))
+                         "  ✓ models.classify classifier $0.002"))))))
+  ;; The explicit false on an empty container needs no rows or details at all.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let* ((messages (pilish-test--nested-history-messages))
+           (parent (copy-tree (aref messages 2) t)))
+      (setf (plist-get parent :nestedCalls) '(:calls [] :complete :false)
+            (plist-get parent :details) nil)
+      (pilish--display-history-messages (vector (aref messages 1) parent)))
+    (should-not (pilish-test--nested-summary-lines "p"))
+    (should (string-match-p "Incomplete saved call summary" (buffer-string)))
+    (should-not (string-match-p "Child outputs are not saved" (buffer-string))))
+  ;; Live event arguments are still available, even if the snapshot omitted
+  ;; them.  The saved-availability suffix must not claim their live loss.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((parent (aref (pilish-test--nested-history-messages) 2)))
+      (pilish-test--nested-event
+       "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "text(1);"))
+      (pilish-test--nested-event
+       "tool_execution_end" "p/2" "p" :toolName "bash" :args '(:command "AVAILABLE-LIVE")
+       :isError t :result '(:content [(:type "text" :text "LIVE-ERROR")]))
+      (pilish--handle-display-event (list :type "message_end" :message parent)))
+    (should (string-match-p "AVAILABLE-LIVE" (buffer-string)))
+    (should-not (string-match-p "saved arguments omitted" (buffer-string)))))
+
+(ert-deftest pilish-test-nested-history-late-snapshot-is-not-replay ()
+  "Late live success does not amend the saved unfinished snapshot on reload."
+  ;; Mutating raw saved records, replaying current live status, or inventing
+  ;; child output makes history claim facts which Pi never persisted.
+  (let* ((path (expand-file-name "nested-tools-session.jsonl" pilish-test--fixture-dir))
+         (original-bytes (with-temp-buffer
+                           (insert-file-contents-literally path) (buffer-string)))
+         (messages (pilish-test--nested-history-messages))
+         (parent (aref messages 2)))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (pilish-test--nested-event
+       "tool_execution_start" "p" nil :toolName "codemode"
+       :args (plist-get (aref (plist-get (aref messages 1) :content) 0) :arguments))
+      (pilish-test--nested-event
+       "tool_execution_start" "p/3" "p" :toolName "read" :args '(:path "CHILD-LATE"))
+      (pilish-test--nested-event
+       "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+       :result (list :content (plist-get parent :content) :details (plist-get parent :details)))
+      (pilish--handle-display-event (list :type "message_end" :message parent))
+      (pilish--handle-display-event '(:type "agent_end" :messages []))
+      (pilish--handle-display-event '(:type "agent_settled"))
+      (pilish--render-history-text "NEWER-TURN")
+      (let ((root (pilish--nested-tool-owner "p")))
+        (should (equal (cdr (assoc "p/3" (pilish-test--nested-summary-lines "p" t)))
+                       "  … read {\"path\":\"CHILD-LATE\"}"))
+        (pilish-test--nested-event
+         "tool_execution_end" "p/3" "p" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "LATE-LIVE-OUTPUT")]))
+        (should (equal (cdr (assoc "p/3" (pilish-test--nested-summary-lines "p" t)))
+                       "  ✓ read {\"path\":\"CHILD-LATE\"}"))
+        (should (eq 'ok (pilish--nested-call-status (pilish--nested-call-get root "p/3"))))
+        (pilish-test--nested-tab "p" '(child . "p/3"))
+        (should (string-match-p "LATE-LIVE-OUTPUT" (buffer-string)))
+        (should (< (pilish-test--hover-pos "  ✓ read {\"path\":\"CHILD-LATE\"}")
+                   (pilish-test--hover-pos "NEWER-TURN"))))
+      ;; Reload the original file, not an amended live-record projection.
+      (pilish--display-session-history (pilish-test--nested-history-messages) (current-buffer))
+      (should (equal (cdr (assoc "p/3" (pilish-test--nested-summary-lines "p" t)))
+                     "  ? read {\"path\":\"CHILD-LATE\"} unfinished when saved"))
+      (should (= 4 (length (pilish-test--nested-summary-lines "p"))))
+      (should (< (pilish-test--hover-pos "unfinished when saved")
+                 (pilish-test--hover-pos "GENERIC-DONE")))
+      (should-not (string-match-p "LATE-LIVE-OUTPUT" (buffer-string)))
+      (should-not (string-match-p (regexp-quote "[+ output]") (buffer-string)))
+      (should (string-match-p "Child outputs are not saved in sessions." (buffer-string)))
+      (should (string-match-p "Incomplete saved call summary" (buffer-string)))
+      (should-not (pilish--nested-tool-owner "p")))
+    (should (equal original-bytes (with-temp-buffer
+                                   (insert-file-contents-literally path) (buffer-string))))))
+
+(ert-deftest pilish-test-nested-history-details-only-and-saved-status-precedence ()
+  "Saved details enrich exact IDs without duplicate rows or runtime ownership."
+  ;; Replaying details statuses downgrades saved success/unfinished.  Treating
+  ;; model/details rows as live execution pins snapshots or invents output.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let* ((messages (pilish-test--nested-history-messages))
+           (parent (copy-tree (aref messages 2) t)))
+      (setf (plist-get parent :details)
+            '(:calls [(:id "p/1" :name "read" :status "cancelled")
+                       (:id "p/2" :name "bash" :args "{\"command\":\"CHILD-ERROR\"}"
+                        :status "cancelled" :error "cancelled signal" :cost 0.003)
+                       (:id "p/2" :name "bash" :status "cancelled" :cost 0.003)
+                       (:id "p/3" :name "read" :status "cancelled")
+                       (:id "p/model" :name "models.classify" :args "model input"
+                        :status "running" :durationMs 0 :cost 0)
+                       (:id "p/?" :name "read" :status "cancelled")]
+              :fullOutputPath "/tmp/SAVED-FULL-OUTPUT"))
+      (pilish--display-history-messages (vector (aref messages 1) parent))
+      (should (equal (pilish-test--nested-summary-lines "p" t)
+                     '(("p/1" . "  ✓ read {\"path\":\"/tmp/CHILD-READ\"}")
+                       ("p/2" . "  ⊘ bash {\"command\":\"CHILD-ERROR\"} $0.003 — cancelled signal")
+                       ("p/3" . "  ? read {\"path\":\"CHILD-LATE\"} unfinished when saved")
+                       ("p/model" . "  ? models.classify model input $0 unfinished when saved"))))
+      (should (equal (cdr (assoc "p/model" (pilish-test--nested-summary-lines "p")))
+                     "  ? models.classify model input 0ms $0 unfinished when saved"))
+      (should (string-match-p "saved arguments omitted (9000 bytes)" (buffer-string)))
+      (should (= 1 (pilish-test--count-matches "Full output: /tmp/SAVED-FULL-OUTPUT" (buffer-string))))
+      (should-not (string-match-p (regexp-quote "[+ output]") (buffer-string)))
+      (should-not (pilish--nested-tool-owner "p"))
+      (should-not (pilish--tool-block-get "p"))
+      (let* ((overlay (car (pilish-test--all-tool-overlays)))
+             (root (pilish--tool-block-from-overlay overlay)))
+        (should-not (pilish--nested-pending-p root))
+        (setq pilish--hot-tail-start (copy-marker (point-max)))
+        (pilish--queue-tool-cooling-outside-hot-tail)
+        (pilish-test--drain-tool-cooling)
+        (should-not (overlay-buffer overlay))
+        (should-not (pilish--tool-block-nested-calls root))
+        (should (string-match-p "unfinished when saved" (buffer-string))))))
+  ;; No nestedCalls at all: stable model rows and anonymous tool fallbacks
+  ;; still use the shared grammar, with saved running shown as unfinished.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let* ((messages (pilish-test--nested-history-messages))
+           (parent (copy-tree (aref messages 6) t)))
+      (setf (plist-get parent :details)
+            '(:calls [(:id "d/1" :name "models.classify" :args "test/classifier"
+                        :status "ok" :durationMs 2 :cost 0.002)
+                       (:id "d/1" :name "models.classify" :status "ok" :cost 0.002)
+                       (:id "d/?" :name "read" :args "preview-one" :status "running")
+                       (:id "d/?" :name "read" :args "preview-two" :status "error" :error "failed")]))
+      (pilish--display-history-messages (vector (aref messages 5) parent)))
+    (should (equal (pilish-test--nested-summary-lines "d" t)
+                   '(("d/1" . "  ✓ models.classify test/classifier $0.002")
+                     (nil . "  ? read preview-one unfinished when saved")
+                     (nil . "  ✗ read preview-two — failed"))))
+    (should (= 1 (pilish-test--count-matches "Child outputs are not saved in sessions." (buffer-string))))
+    (should-not (string-match-p "Incomplete saved call summary" (buffer-string)))
+    (should-not (pilish--nested-tool-owner "d"))
+    (should-not (pilish--tool-block-get "d"))
+    (should-not (pilish--nested-pending-p
+                 (pilish--tool-block-from-overlay (car (pilish-test--all-tool-overlays)))))))
+
+(ert-deftest pilish-test-nested-history-empty-codemode-calls ()
+  "A saved codemode calls array enables readable code even without children."
+  ;; Gating on child rows sends valid local-only scripts back through the
+  ;; escaped JSON header/details path instead of the shared compound body.
+  (dolist (variant '(((:calls []) "")
+                     ((:calls [] :fullOutputPath "/tmp/LOCAL-FULL-OUTPUT")
+                      "Full output: /tmp/LOCAL-FULL-OUTPUT\n")))
+    (ert-info ((format "details: %S" (car variant)))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--display-history-messages
+         (vector '(:role "assistant" :content
+                   [(:type "toolCall" :id "local-only" :name "codemode"
+                     :arguments (:code "const total = 1 + 2;\ntext(total);"))])
+                 (list :role "toolResult" :toolCallId "local-only" :toolName "codemode"
+                       :content [(:type "text" :text "Script completed\nWall time 0.0 seconds\nOutput:\n3")]
+                       :details (car variant) :isError :false)))
+        (let* ((overlay (car (pilish-test--all-tool-overlays)))
+               (root (pilish--tool-block-from-overlay overlay)))
+          (should (equal (buffer-substring-no-properties (overlay-start overlay) (overlay-end overlay))
+                         (concat "codemode\n```javascript\nconst total = 1 + 2;\ntext(total);\n```\n"
+                                 "```\nScript completed\nWall time 0.0 seconds\nOutput:\n3\n```\n"
+                                 (cadr variant))))
+          (should-not (pilish-test--nested-summary-lines "local-only"))
+          (should-not (string-match-p (regexp-opt '("Child calls" "Child outputs are not saved"
+                                                   "Incomplete saved call summary" "**Details**"))
+                                      (buffer-string)))
+          (should-not (pilish--nested-tool-owner "local-only"))
+          (should-not (pilish--tool-block-get "local-only"))
+          (should-not (pilish--nested-pending-p root)))))))
+
+(ert-deftest pilish-test-nested-history-unrecognized-codemode-details-stay-legacy ()
+  "Absent or wrong-type codemode calls metadata keeps the old presentation."
+  ;; Tool name, unrelated metadata, or a calls object is not a calls array.
+  (dolist (details '(nil (:fullOutputPath "LEGACY-PATH") (:calls :null)
+                        (:calls "not an array")
+                        (:calls (:id "old/1" :name "read" :status "ok"))))
+    (ert-info ((format "details: %S" details))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--display-history-messages
+         (vector '(:role "assistant" :content
+                   [(:type "toolCall" :id "old-code" :name "codemode" :arguments (:code "text(1);"))])
+                 (append '(:role "toolResult" :toolCallId "old-code" :toolName "codemode"
+                           :content [(:type "text" :text "LEGACY-OUTPUT")] :isError :false)
+                         (when details (list :details details)))))
+        (let ((overlay (car (pilish-test--all-tool-overlays))))
+          (should (string-prefix-p "codemode { \"code\": \"text(1);\" }\n"
+                                   (buffer-substring-no-properties
+                                    (overlay-start overlay) (overlay-end overlay)))))
+        (should (string-match-p "LEGACY-OUTPUT" (buffer-string)))
+        (should-not (string-match-p "javascript" (buffer-string)))
+        (should-not (pilish-test--nested-summary-lines "old-code"))
+        (should-not (pilish--nested-tool-owner "old-code"))))))
+
+(ert-deftest pilish-test-nested-history-old-and-malformed-sessions ()
+  "Old tool bodies are unchanged; malformed optional summary fields are safe."
+  ;; Enabling compound rendering by tool name alone changes an old extension's
+  ;; output.  Accepting a non-array calls field invents a new-shaped session.
+  (dolist (nested '(nil :null :false 17 "bad" []
+                       (:complete :false)
+                       (:calls :null :complete :false)
+                       (:calls 17 :complete :false)
+                       (:calls "bad" :complete :false)
+                       (:calls (:not-an-array t) :complete :false)))
+    (ert-info ((format "nestedCalls: %S" nested))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--display-history-messages
+         (vector '(:role "assistant" :content
+                   [(:type "toolCall" :id "old-code" :name "codemode" :arguments (:code "text(1);"))])
+                 (list :role "toolResult" :toolCallId "old-code" :toolName "codemode"
+                       :content [(:type "text" :text "LEGACY-OUTPUT")] :isError :false
+                       :nestedCalls nested)))
+        (let ((overlay (car (pilish-test--all-tool-overlays))))
+          (should (equal (buffer-substring-no-properties (overlay-start overlay) (overlay-end overlay))
+                         "codemode { \"code\": \"text(1);\" }\n```\nLEGACY-OUTPUT\n```\n")))
+        (should-not (pilish-test--nested-summary-lines "old-code"))
+        (should-not (string-match-p (regexp-opt '("Child calls" "Incomplete saved call summary"))
+                                    (buffer-string))))))
+  ;; Recognized containers survive bad individual rows without fabricated
+  ;; arguments, timing, errors, child outputs, or missing-call counts.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let* ((messages (pilish-test--nested-history-messages))
+           (parent (copy-tree (aref messages 2) t)))
+      (setf (plist-get parent :nestedCalls)
+            '(:calls [nil 17 "bad" (:id "" :name "read" :status "ok")
+                       (:id "bad-name" :name 7 :status "ok")
+                       (:id "bad-status" :name "read" :status "cancelled")
+                       (:name "read" :status "ok")
+                       (:id "good" :name "read" :arguments (:path "SAFE") :status "ok" :durationMs 0)
+                       (:id "wrong-fields" :name "bash" :arguments ["bad"] :argumentsBytes "bad"
+                        :status "error" :durationMs -1 :error [] :cost 7)]
+              :complete :false)
+            (plist-get parent :details)
+            '(:calls [nil :false 17 "bad" (:id "bad" :name [] :status "ok")
+                       (:id "wrong-fields" :name "bash" :status "error" :args [] :cost -1)
+                       (:id "unknown-status" :name "read" :status "wat")]))
+      (pilish--display-history-messages (vector (aref messages 1) parent)))
+    (should (equal (pilish-test--nested-summary-lines "p")
+                   '(("good" . "  ✓ read {\"path\":\"SAFE\"} 0ms")
+                     ("wrong-fields" . "  ✗ bash"))))
+    (should (string-match-p "Incomplete saved call summary" (buffer-string)))
+    (should-not (string-match-p (regexp-opt '("saved arguments omitted" "more calls not recorded"))
+                                (buffer-string))))
+  ;; Raw pre-1.0 files still parse and reach the ordinary history renderer.
+  (dolist (fixture '(("browse-session.jsonl" "Checking the build config and recent changes.")
+                     ("browse-session-v087.jsonl" "hi there")))
+    (ert-info ((car fixture))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--display-session-history (pilish-test--nested-history-messages (car fixture)) (current-buffer))
+        (should (string-match-p (regexp-quote (cadr fixture)) (buffer-string)))
+        (should-not (text-property-any (point-min) (point-max) 'pilish-nested-summary t))
+        (should-not (string-match-p (regexp-opt '("Incomplete saved call summary" "Child outputs are not saved"))
+                                    (buffer-string))))))
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((messages (pilish-test--nested-history-messages)))
+      (pilish--display-history-messages (vector (aref messages 7) (aref messages 8))))
+    (let ((overlay (car (pilish-test--all-tool-overlays))))
+      (should (equal (buffer-substring-no-properties (overlay-start overlay) (overlay-end overlay))
+                     "$ printf LEGACY-OUTPUT\n```\nLEGACY-OUTPUT\n```\n")))))
+
+(ert-deftest pilish-test-nested-history-rebuild-cleans-live-state-and-cools-snapshots ()
+  "Rebuild releases old paints/payloads, while saved unfinished rows cool normally."
+  ;; Keeping live owners/queued paints rewrites the replacement history;
+  ;; skipping unowned history blocks leaves their markers and payloads alive.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let* ((pilish-tool-preview-lines 1)
+           (messages (pilish-test--nested-history-messages))
+           (root (pilish-test--nested-retained-root))
+           (child (pilish--nested-call-get root "complete-child"))
+           (pending (pilish--nested-call-get root "pending-child"))
+           (header (pilish--tool-block-header-end root))
+           (end (pilish--tool-block-end-marker root))
+           (owners pilish--nested-tool-owners))
+      (pilish-test--nested-event
+       "tool_execution_update" "pending-child" "reused-root" :toolName "read"
+       :partialResult '(:content [(:type "text" :text "STALE-PAINT")]))
+      (should pilish--pending-tool-updates)
+      (should (timerp pilish--tool-update-flush-timer))
+      (should (pilish--nested-pending-p root))
+      (pilish--display-session-history messages (current-buffer))
+      (should (= 0 (hash-table-count owners)))
+      (should-not (marker-buffer header))
+      (should-not (marker-buffer end))
+      (should-not (pilish--tool-block-args root))
+      (should-not (pilish--tool-block-result root))
+      (should-not (pilish--nested-call-result child))
+      (should-not (pilish--nested-call-arguments pending))
+      (should-not (pilish--nested-call-pending-end-p pending))
+      (should-not pilish--pending-tool-updates)
+      (should-not pilish--tool-update-flush-timer)
+      (let* ((history-root (seq-find (lambda (block) (equal (pilish--tool-block-tool-call-id block) "p"))
+                                     (mapcar #'pilish--tool-block-from-overlay (pilish-test--all-tool-overlays))))
+             (saved-header (pilish--tool-block-header-end history-root))
+             (saved-end (pilish--tool-block-end-marker history-root)))
+        (should (pilish--tool-block-result history-root))
+        (should-not (pilish--nested-pending-p history-root))
+        (pilish--display-session-history messages (current-buffer))
+        (should-not (marker-buffer saved-header))
+        (should-not (marker-buffer saved-end))
+        (should-not (pilish--tool-block-result history-root))
+        (should-not (pilish--tool-block-nested-calls history-root)))
+      (should (= 4 (length (pilish-test--all-tool-overlays))))
+      (should (= 3 (pilish-test--count-matches "Child outputs are not saved in sessions." (buffer-string))))
+      (should (= 1 (pilish-test--count-matches "Incomplete saved call summary" (buffer-string))))
+      (let ((before (buffer-string)))
+        (pilish--flush-tool-updates (current-buffer))
+        (pilish-test--nested-event
+         "tool_execution_end" "pending-child" "reused-root" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "STALE-RESULT")]))
+        (should (equal before (buffer-string))))
+      ;; Hot history has ordinary independent script/list folds, not owners.
+      (let* ((history-root (seq-find (lambda (block) (equal (pilish--tool-block-tool-call-id block) "p"))
+                                     (mapcar #'pilish--tool-block-from-overlay (pilish-test--all-tool-overlays))))
+             (overlay (pilish--tool-block-overlay history-root)))
+        (should (equal (mapcar #'car (pilish-test--nested-summary-lines "p")) '("p/models.classify/1")))
+        (should-not (string-match-p (regexp-quote "text(read);") (buffer-string)))
+        (goto-char (overlay-start overlay))
+        (pilish-toggle-tool-section)
+        (should (string-match-p (regexp-quote "text(read);") (buffer-string)))
+        (should (equal (mapcar #'car (pilish-test--nested-summary-lines "p")) '("p/models.classify/1")))
+        (goto-char (overlay-start overlay))
+        (search-forward "Child calls")
+        (pilish-toggle-tool-section)
+        (should (= 4 (length (pilish-test--nested-summary-lines "p"))))
+        (should (string-match-p (regexp-quote "text(read);") (buffer-string)))
+        (should-not (pilish--nested-tool-owner "p"))
+        (should-not (pilish--tool-block-get "p"))
+        (let ((rows (pilish-test--nested-summary-lines "p")))
+          (setq pilish--hot-tail-start (copy-marker (point-max)))
+          (pilish--queue-tool-cooling-outside-hot-tail)
+          (pilish-test--drain-tool-cooling)
+          (should-not (pilish-test--all-tool-overlays))
+          (should (equal rows (pilish-test--nested-summary-lines "p")))
+          (should (string-match-p "unfinished when saved" (buffer-string)))
+          (should (= 3 (pilish-test--count-matches "Child outputs are not saved in sessions." (buffer-string))))
+          (should (= 1 (pilish-test--count-matches "Incomplete saved call summary" (buffer-string)))))))))
+
+;;; Codemode script and exact-ID metadata
+
+(ert-deftest pilish-test-codemode-script-is-readable-and-independently-folded ()
+  "Authoritative JavaScript replaces JSON and folds without hiding siblings."
+  ;; A generic JSON header, whole-body toggle, or duplicate final decoration
+  ;; loses the readable script or an independently opened sibling.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 10)
+          (script "const quote = \"λ\";\n\nconst fence = \"```\";\nconst tilde = \"~~~~\";\nconst a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5;\nconst f = 6;\nconst g = 7;\ntext(\"SCRIPT-HIDDEN\");"))
+      (cl-letf (((symbol-function 'pilish--chat-display-width) (lambda () 80)))
+        (pilish--handle-toolcall-message-event
+         '(:type "toolcall_start" :contentIndex 0 :id "p" :toolName "codemode"))
+        (pilish--handle-toolcall-message-event
+         '(:type "toolcall_end" :contentIndex 0
+           :toolCall (:type "toolCall" :id "p" :name "codemode"
+                      :arguments (:code "PREVIEW-SCRIPT"))))
+        (pilish--reconcile-toolcall-previews
+         (list :role "assistant" :content
+               (vector (list :type "toolCall" :id "p" :name "codemode"
+                             :arguments (list :code script)))))
+        (should (string-match-p "^~~~~~javascript\nconst quote = \"λ\";\n" (buffer-string)))
+        (should-not (string-match-p (regexp-quote "\\n") (buffer-string)))
+        (should-not (string-match-p "PREVIEW-SCRIPT\\|SCRIPT-HIDDEN" (buffer-string)))
+        (pilish-test--nested-event
+         "tool_execution_start" "p" nil :toolName "codemode" :args (list :code script))
+        (dotimes (index 12)
+          (let ((id (format "p/%d" index)))
+            (pilish-test--nested-event
+             "tool_execution_start" id "p" :toolName "read" :args (list :path id))
+            (pilish-test--nested-event
+             "tool_execution_end" id "p" :toolName "read" :isError nil
+             :result '(:content [(:type "text" :text "CHILD-OUTPUT")]))))
+        (pilish-test--nested-event
+         "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+         :result '(:content [(:type "text" :text "PARENT-OUTPUT")]))
+        (pilish-test--nested-tab "p" 'children)
+        (pilish-test--nested-tab "p" '(child . "p/0"))
+        ;; Header TAB prefers JavaScript, not the child list or output.
+        (pilish-test--nested-tab "p" nil)
+        (should (string-match-p (regexp-quote script) (buffer-string)))
+        (should (= 12 (length (pilish-test--nested-summary-lines "p"))))
+        (should (string-match-p "CHILD-OUTPUT" (buffer-string)))
+        (should (string-match-p "PARENT-OUTPUT" (buffer-string)))
+        (should (= 1 (pilish-test--count-matches "javascript" (buffer-string))))
+        (pilish-test--nested-tab "p" 'script)
+        (should-not (string-match-p "SCRIPT-HIDDEN" (buffer-string)))
+        (should (= 12 (length (pilish-test--nested-summary-lines "p"))))
+        (should (string-match-p "CHILD-OUTPUT" (buffer-string)))
+        (should (string-match-p "PARENT-OUTPUT" (buffer-string)))
+        (should (= 1 (length (pilish-test--all-tool-overlays))))))))
+
+(ert-deftest pilish-test-codemode-partial-or-invalid-code-is-safe ()
+  "Partial generation is name-only; each authoritative code value replaces it."
+  ;; Parsing generic deltas, trusting malformed code, or retaining stale
+  ;; authority after execution has started breaks this boundary.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_start" :contentIndex 0 :id "p" :toolName "codemode"))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_delta" :contentIndex 0 :delta "{\"code\":\"RAW-PARTIAL\\n"))
+    (pilish--flush-stream-deltas)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "codemode\n"))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "p" :name "codemode"
+                  :arguments (:code "text(\"FULL\");\nreturn \"λ\";"))))
+    (should (string-match-p "text(\"FULL\");\nreturn \"λ\";" (buffer-string)))
+    (should-not (string-match-p "RAW-PARTIAL" (buffer-string)))
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "EXEC-SCRIPT"))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "p" :name "codemode"
+                  :arguments (:code "FINAL-AUTHORITY"))))
+    (should (string-match-p "FINAL-AUTHORITY" (buffer-string)))
+    (should-not (string-match-p "EXEC-SCRIPT\\|FULL" (buffer-string)))
+    (dolist (args '(nil (:other "not code") (:code nil) (:code 17)
+                       (:code ["not code"]) (:code "")))
+      (pilish--handle-toolcall-message-event
+       (list :type "toolcall_end" :contentIndex 0
+             :toolCall (list :type "toolCall" :id "p" :name "codemode" :arguments args)))
+      (should-not (string-match-p "javascript\\|FINAL-AUTHORITY\\|not code" (buffer-string)))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max)) "codemode\n")))
+    (should (= 1 (length (pilish-test--all-tool-overlays)))))
+  (with-temp-buffer
+    (pilish-chat-mode)
+    ;; Readable generation is still a preview until execution is observed.
+    ;; A corrected authoritative identity must rekey it, not pin the old ID.
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_start" :contentIndex 0 :id "old" :toolName "codemode"))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "old" :name "codemode" :arguments (:code "OLD-SCRIPT"))))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "corrected" :name "codemode" :arguments (:code "NEW-SCRIPT"))))
+    (should (pilish--tool-block-get "corrected"))
+    (should-not (pilish--tool-block-get "old"))
+    (should-not (pilish--nested-tool-owner "old"))
+    (should (string-match-p "NEW-SCRIPT" (buffer-string)))
+    (should-not (string-match-p "OLD-SCRIPT" (buffer-string)))
+    (should (= 1 (length (pilish-test--all-tool-overlays))))
+    (pilish--reconcile-toolcall-previews '(:role "assistant" :content []))
+    (should-not (pilish-test--all-tool-overlays))
+    (should-not (pilish--nested-tool-owner "corrected"))))
+
+(ert-deftest pilish-test-codemode-final-preview-preserves-script-view ()
+  "Final pre-execution authority preserves both readers' unchanged script views."
+  ;; Clearing the readable preview before compound redraw loses its section
+  ;; geometry.  Presentation must not make the preview execution-backed.
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let* ((call '(:type "toolCall" :id "p" :name "codemode"
+                    :arguments (:code "const first = 1;\nconst MARKER = 2;\nconst OTHER = 3;\nreturn first;")))
+             (selected (selected-window))
+             (other (split-window-right)))
+        (set-window-buffer other (current-buffer))
+        (pilish--handle-toolcall-message-event
+         '(:type "toolcall_start" :contentIndex 0 :id "p" :toolName "codemode"))
+        (pilish--handle-toolcall-message-event
+         (list :type "toolcall_end" :contentIndex 0 :toolCall call))
+        (goto-char (+ 2 (pilish-test--hover-pos "MARKER")))
+        (set-window-start selected (pilish-test--hover-pos "const first") t)
+        (set-window-point other (+ 1 (pilish-test--hover-pos "OTHER")))
+        (set-window-start other (pilish-test--hover-pos "const OTHER") t)
+        (let ((point-before (point))
+              (selected-start (window-start selected))
+              (other-point (window-point other))
+              (other-start (window-start other))
+              (text (buffer-substring-no-properties (point-min) (point-max))))
+          (pilish--reconcile-toolcall-previews
+           (list :role "assistant" :content (vector call)))
+          (should (= point-before (point)))
+          (should (looking-at-p "RKER"))
+          (should (= point-before (window-point selected)))
+          (should (= selected-start (window-start selected)))
+          (should (= other-point (window-point other)))
+          (should (pilish-test--window-point-text-p other "THER"))
+          (should (= other-start (window-start other)))
+          (should (equal text (buffer-substring-no-properties (point-min) (point-max)))))
+        (should-not (pilish--tool-block-execution-backed-p (pilish--tool-block-get "p")))
+        (pilish--reconcile-toolcall-previews '(:role "assistant" :content []))
+        (should-not (pilish-test--all-tool-overlays))
+        (should-not (pilish--nested-tool-owner "p"))))))
+
+(ert-deftest pilish-test-codemode-final-preview-replaced-by-ordinary-tool ()
+  "Final ordinary-tool authority removes the superseded codemode preview."
+  ;; Deferring a clear based on the old presentation, rather than the next
+  ;; body's renderer, leaves obsolete JavaScript beneath the new header.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_start" :contentIndex 0 :id "p" :toolName "codemode"))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "p" :name "codemode"
+                  :arguments (:code "STALE-SCRIPT"))))
+    (let ((block (pilish--tool-block-get "p")))
+      (should (string-match-p "STALE-SCRIPT" (buffer-string)))
+      (should-not (pilish--tool-block-execution-backed-p block))
+      (pilish--reconcile-toolcall-previews
+       '(:role "assistant"
+         :content [(:type "toolCall" :id "p" :name "bash"
+                    :arguments (:command "echo final"))]))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "$ echo final\n"))
+      (should-not (string-match-p "STALE-SCRIPT" (buffer-string)))
+      (should (eq block (pilish--tool-block-get "p")))
+      (should (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
+                     "bash"))
+      (should-not (pilish--tool-block-compound-p block))
+      (should-not (pilish--tool-block-args block))
+      (should-not (pilish--nested-tool-owner "p"))
+      (should-not (pilish--tool-block-execution-backed-p block))
+      (pilish--reconcile-toolcall-previews '(:role "assistant" :content []))
+      (should-not (pilish-test--all-tool-overlays)))))
+
+(ert-deftest pilish-test-codemode-details-only-preserves-script-and-output ()
+  "Metadata snapshots enrich one list without replacing script or parent text."
+  ;; Empty publication content must not erase previously received output;
+  ;; metadata ingestion must precede a final event that supersedes its paint.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode"
+     :args '(:code "text(\"SCRIPT-SENTINEL\");"))
+    (pilish-test--nested-event
+     "tool_execution_update" "p" nil
+     :partialResult '(:content [(:type "text" :text "PARENT-CONTENT")]))
+    (pilish-test--flush-tool-updates)
+    (pilish-test--nested-event
+     "tool_execution_update" "p" nil
+     :partialResult '(:content [] :details
+                      (:calls [(:id "p/1" :name "DETAIL-ROW" :args "preview"
+                                :status "running")])))
+    (pilish-test--flush-tool-updates)
+    (let ((text (buffer-string)))
+      (should (string-match-p "SCRIPT-SENTINEL" text))
+      (should (string-match-p "PARENT-CONTENT" text))
+      (should (equal (pilish-test--nested-summary-lines "p")
+                     '(("p/1" . "  … DETAIL-ROW preview"))))
+      (should (= 1 (pilish-test--count-matches "DETAIL-ROW" text)))
+      (should-not (string-match-p "\"calls\"" text)))
+    (dolist (status '("error" "running"))
+      (pilish-test--nested-event
+       "tool_execution_update" "p" nil
+       :partialResult (list :content [] :details
+                            (list :calls (vector (list :id "p/1" :name "DETAIL-ROW"
+                                                       :args "preview" :status status))))))
+    (should (= 1 (length pilish--pending-tool-updates)))
+    (pilish-test--nested-event
+     "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+     :result '(:content [(:type "text" :text "FINAL-PARENT")]
+               :details (:calls [(:id "p/1" :name "DETAIL-ROW" :args "final preview"
+                                  :status "ok" :durationMs 12)])))
+    (pilish-test--flush-tool-updates)
+    (should (string-match-p "SCRIPT-SENTINEL" (buffer-string)))
+    (should (string-match-p "FINAL-PARENT" (buffer-string)))
+    (should (equal (pilish-test--nested-summary-lines "p")
+                   '(("p/1" . "  ✓ DETAIL-ROW final preview 12ms"))))
+    (should (= 1 (pilish-test--count-matches "DETAIL-ROW" (buffer-string))))
+    (should-not pilish--pending-tool-updates)))
+
+(ert-deftest pilish-test-codemode-placeholders-never-join-positionally ()
+  "Anonymous snapshots never donate identity, cancellation, or output to events."
+  ;; Deduplicating placeholders or joining by name/order invents execution
+  ;; facts; suppressing all details instead also loses stable unmatched rows.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "return 1;"))
+    (let* ((anonymous '(:id "p/?" :name "bash" :args "same preview" :status "cancelled"
+                       :cost 42 :error "ANONYMOUS-CANCELLATION"))
+           (snapshot (list :content [] :details (list :calls (vector anonymous anonymous)))))
+      (dotimes (_ 2)
+        (pilish-test--nested-event "tool_execution_update" "p" nil :partialResult snapshot)
+        (pilish-test--flush-tool-updates)
+        (let ((rows (pilish-test--nested-summary-lines "p")))
+          (should (= 2 (length rows)))
+          (should (equal (mapcar #'car rows) '(nil nil)))
+          (should (seq-every-p (lambda (row) (string-prefix-p "  ⊘ bash same preview" (cdr row))) rows)))
+        (should-not (pilish--nested-pending-p (pilish--nested-tool-owner "p"))))
+      (pilish-test--nested-event
+       "tool_execution_start" "p/2" "p" :toolName "bash" :args '(:command "EVENT-TWO"))
+      (pilish-test--nested-event
+       "tool_execution_start" "opaque-grandchild" "p/2" :toolName "read" :args '(:path "grand.el"))
+      (pilish-test--nested-event
+       "tool_execution_end" "p/2" "p" :toolName "bash" :isError nil
+       :result '(:content [(:type "text" :text "TWO-OUTPUT")]))
+      ;; A missing start and a different completion order supply no joining key.
+      (pilish-test--nested-event
+       "tool_execution_end" "p/1" "p" :toolName "read" :isError t
+       :result '(:content [(:type "text" :text "UNRELATED-ERROR")]))
+      (setq snapshot
+            (list :content [] :details
+                  (list :calls (vector anonymous anonymous
+                                       '(:id "p/2" :name "bash" :args "DO-NOT-PARSE"
+                                         :status "cancelled" :cost 0.002)
+                                       '(:id "stable-id" :name "extra" :status "ok")))))
+      (dotimes (_ 2)
+        (pilish-test--nested-event "tool_execution_update" "p" nil :partialResult snapshot)
+        (pilish-test--flush-tool-updates)
+        (let ((rows (pilish-test--nested-summary-lines "p" t)))
+          (should (equal (mapcar #'car rows) '("p/2" "opaque-grandchild" "p/1" "stable-id")))
+          (should (string-prefix-p "  ✓ bash {\"command\":\"EVENT-TWO\"}" (cdar rows)))
+          (should (equal (cdr (assoc "p/1" rows)) "  ✗ read — UNRELATED-ERROR"))
+          (should (equal (cdr (assoc "opaque-grandchild" rows)) "  … read {\"path\":\"grand.el\"}")))
+        (should-not (string-match-p "ANONYMOUS-CANCELLATION\\|\\$42\\|DO-NOT-PARSE" (buffer-string))))
+      (pilish-test--nested-tab "p" '(child . "p/2"))
+      (should (string-match-p "TWO-OUTPUT" (buffer-string)))
+      (should-not (string-match-p "TWO-OUTPUT" (cdr (assoc "p/1" (pilish-test--nested-summary-lines "p")))))
+      (should (eq (pilish--nested-tool-owner "p") (pilish--nested-tool-owner "opaque-grandchild")))
+      (should-not (pilish--nested-tool-owner "p/?")))))
+
+(ert-deftest pilish-test-codemode-model-only-and-mixed-details ()
+  "Stable model metadata stays summary-only and exact tool IDs upgrade in place."
+  ;; Treating every details row as owed tool execution pins model-only roots;
+  ;; discarding unmatched IDs or creating a new record loses metadata or rows.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "return 1;"))
+    (let* ((models [(:id "p/model-1" :name "models.classify" :args "classifier input"
+                    :status "ok" :cost 0.002)
+                   (:id "p/model-2" :name "models.generateImages" :status "cancelled")])
+           (root (pilish--nested-tool-owner "p")))
+      (pilish-test--nested-event
+       "tool_execution_update" "p" nil :partialResult (list :content [] :details (list :calls models)))
+      (pilish-test--flush-tool-updates)
+      (should (equal (pilish-test--nested-summary-lines "p")
+                     '(("p/model-1" . "  ✓ models.classify classifier input $0.002")
+                       ("p/model-2" . "  ⊘ models.generateImages"))))
+      (should-not (pilish--nested-pending-p root))
+      (should-not (string-match-p (regexp-quote "[+ output]") (buffer-string)))
+      (should-not (pilish--nested-tool-owner "p/model-1"))
+      (pilish-test--nested-event
+       "tool_execution_update" "p" nil
+       :partialResult (list :content [] :details
+                            (list :calls (vconcat models
+                                                 [(:id "p/?" :name "read" :status "running")
+                                                  (:id "detail-tool" :name "read" :args "preview only"
+                                                   :status "ok" :durationMs 9)]))))
+      (pilish-test--flush-tool-updates)
+      ;; Model rows alone do not suppress the anonymous tool fallback.
+      (should (equal (mapcar #'car (pilish-test--nested-summary-lines "p"))
+                     '("p/model-1" "p/model-2" nil "detail-tool")))
+      (let ((details-record (pilish--nested-call-get root "detail-tool")))
+        (pilish-test--nested-event
+         "tool_execution_start" "real-child" "p" :toolName "bash" :args '(:command "real"))
+        (pilish-test--nested-event
+         "tool_execution_start" "detail-tool" "p" :toolName "read" :args '(:path "EVENT.el"))
+        (should (eq details-record (pilish--nested-call-get root "detail-tool")))
+        (should (eq root (pilish--nested-tool-owner "detail-tool")))
+        (should (pilish--nested-call-pending-end-p details-record))
+        (should (equal (pilish-test--nested-summary-lines "p" t)
+                       '(("real-child" . "  … bash {\"command\":\"real\"}")
+                         ("detail-tool" . "  … read {\"path\":\"EVENT.el\"}")
+                         ("p/model-1" . "  ✓ models.classify classifier input $0.002")
+                         ("p/model-2" . "  ⊘ models.generateImages"))))
+        (should-not (string-match-p (regexp-quote "[+ output]") (buffer-string)))
+        (pilish-test--nested-event
+         "tool_execution_end" "detail-tool" "p" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "RECEIVED-OUTPUT")]))
+        (pilish-test--nested-tab "p" '(child . "detail-tool"))
+        (should (string-match-p "RECEIVED-OUTPUT" (buffer-string)))
+        (should (= 4 (length (pilish-test--nested-summary-lines "p"))))
+        (should-not (pilish--nested-call-result (pilish--nested-call-get root "p/model-1")))))))
+
+(ert-deftest pilish-test-codemode-cancelled-metadata-does-not-end-execution ()
+  "Exact cancellation evidence changes display, not owed ends or successful facts."
+  ;; Equating cancellation display with completion cools a root too early;
+  ;; global/anonymous intent cannot refine another ID's received failure.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "return 1;"))
+    (pilish-test--nested-event
+     "tool_execution_start" "success-later" "p" :toolName "read" :args '(:path "a.el"))
+    (let* ((root (pilish--nested-tool-owner "p"))
+           (overlay (pilish--tool-block-overlay root))
+           (call (pilish--nested-call-get root "success-later")))
+      (pilish-test--nested-event
+       "tool_execution_update" "p" nil
+       :partialResult '(:content [] :details
+                        (:calls [(:id "success-later" :name "read" :status "cancelled")])))
+      (pilish-test--flush-tool-updates)
+      (should (equal (pilish-test--nested-summary-lines "p" t)
+                     '(("success-later" . "  ⊘ read {\"path\":\"a.el\"}"))))
+      (should (pilish--nested-call-pending-end-p call))
+      (should (pilish--nested-pending-p root))
+      (pilish--set-aborted t)
+      (dolist (id '("unrelated-error" "refined-error"))
+        (pilish-test--nested-event
+         "tool_execution_end" id "p" :toolName "bash" :isError t
+         :result '(:content [(:type "text" :text "FAILED")])))
+      (pilish-test--nested-event
+       "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+       :result '(:content [(:type "text" :text "PARENT-DONE")]
+                 :details (:calls [(:id "success-later" :name "read" :status "cancelled")
+                                   (:id "refined-error" :name "bash" :status "cancelled")
+                                   (:id "p/?" :name "bash" :status "cancelled")])))
+      (should (eq 'error (pilish--nested-call-status (pilish--nested-call-get root "unrelated-error"))))
+      (should (eq 'cancelled (pilish--nested-call-status (pilish--nested-call-get root "refined-error"))))
+      (let ((inhibit-read-only t)) (goto-char (point-max)) (insert "\nNEWER\n"))
+      (setq pilish--hot-tail-start (copy-marker (point-max)))
+      (pilish--queue-tool-cooling-outside-hot-tail)
+      (pilish-test--drain-tool-cooling)
+      (should (overlay-buffer overlay))
+      (should-not (pilish--cool-tool-overlay overlay))
+      (should (pilish--nested-pending-p root))
+      (pilish-test--nested-event
+       "tool_execution_end" "success-later" "p" :toolName "read" :isError nil
+       :result '(:content [(:type "text" :text "ACTUAL-SUCCESS")]))
+      (should (eq 'ok (pilish--nested-call-status call)))
+      (should-not (pilish--nested-pending-p root))
+      (should (memq overlay pilish--tool-cooling-queue))
+      ;; Even final metadata arriving late cannot regress observed success.
+      (dolist (status '("running" "cancelled"))
+        (pilish-test--nested-event
+         "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+         :result (list :content [(:type "text" :text "PARENT-DONE")]
+                       :details (list :calls (vector (list :id "success-later" :name "read" :status status)))))
+        (should (eq 'ok (pilish--nested-call-status call))))
+      (should (equal (pilish-test--nested-summary-lines "p" t)
+                     '(("success-later" . "  ✓ read {\"path\":\"a.el\"}")
+                       ("unrelated-error" . "  ✗ bash — FAILED")
+                       ("refined-error" . "  ⊘ bash — FAILED"))))
+      (pilish-test--drain-tool-cooling)
+      (should-not (overlay-buffer overlay))))
+  ;; Direct normalization also respects saved status precedence.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "return 1;"))
+    (let ((root (pilish--nested-tool-owner "p")))
+      (setf (pilish--tool-block-nested-calls root)
+            (list (pilish--make-nested-call :id "ok" :name "read" :source 'saved :status 'ok)
+                  (pilish--make-nested-call :id "unfinished" :name "read" :source 'saved :status 'unfinished)
+                  (pilish--make-nested-call :id "error" :name "read" :source 'saved :status 'error)))
+      (pilish--merge-codemode-calls
+       root [(:id "ok" :name "read" :status "cancelled")
+             (:id "unfinished" :name "read" :status "cancelled")
+             (:id "error" :name "read" :status "cancelled")
+             (:id "unmatched" :name "models.classify" :status "running")]
+       t)
+      (should (equal (mapcar #'pilish--nested-call-status (pilish--tool-block-nested-calls root))
+                     '(ok unfinished cancelled unfinished)))
+      (should (equal (substring-no-properties
+                      (pilish--nested-call-summary (pilish--nested-call-get root "unfinished") t))
+                     "  ? read unfinished when saved"))
+      (should-not (pilish--nested-pending-p root)))))
+
+(ert-deftest pilish-test-codemode-metadata-bounds-and-generic-details ()
+  "Optional metadata is bounded, literal, and local to recognized codemode rows."
+  ;; Negative/non-finite numbers, raw controls, unbounded errors, or a generic
+  ;; details.calls feeder fabricate fields or inject additional summary rows.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "p" nil :toolName "codemode" :args '(:code "return 1;"))
+    (pilish-test--nested-event
+     "tool_execution_end" "good" "p" :toolName "read" :isError nil
+     :result '(:content []))
+    (let* ((bounded (list :id "bounded" :name "N\n\1" :status "error"
+                          :args (concat "arg\n\1" (make-string 100 ?a))
+                          :error (concat "err\r\2" (make-string 100 ?e))
+                          :durationMs 1500 :cost 0.00216))
+           (calls (vector '(:id "zero" :name "zero" :status "ok" :durationMs 0 :cost 0)
+                          '(:id "absent" :name "absent" :status "ok" :args [] :error 7
+                            :durationMs -1 :cost "bad")
+                          bounded
+                          '(:id "negative" :name "negative" :status "ok" :durationMs -5 :cost -1)
+                          '(:id "infinite" :name "infinite" :status "ok" :durationMs 1.0e+INF :cost 1.0e+INF)
+                          '(:id "nan" :name "nan" :status "ok" :durationMs 0.0e+NaN :cost 0.0e+NaN)
+                          '(:id "empty" :name "empty" :status "ok" :args "" :error "")
+                          nil 17 "not a row" '(:id "" :name "bad" :status "ok")
+                          '(:id 7 :name "bad" :status "ok")
+                          '(:name "bad" :status "ok")
+                          '(:id "good" :name [] :status "error")
+                          '(:id "unknown-status" :name "bad" :status "wat")))
+           (details (list :calls calls :fullOutputPath "/tmp/FULL-OUTPUT" :kept "KEEP-METADATA"))
+           (root (pilish--nested-tool-owner "p")))
+      (pilish-test--nested-event
+       "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+       :result (list :content (vector (list :type "text" :text
+                                           (mapconcat (lambda (n) (format "PARENT-%d" n))
+                                                      (number-sequence 1 15) "\n")))
+                     :details details))
+      (let ((rows (pilish-test--nested-summary-lines "p")))
+        (should (equal (mapcar #'car rows)
+                       '("good" "zero" "absent" "bounded" "negative" "infinite" "nan" "empty")))
+        (should (equal (cdr (assoc "good" rows)) "  ✓ read"))
+        (should (equal (cdr (assoc "zero" rows)) "  ✓ zero 0ms $0"))
+        (dolist (id '("absent" "negative" "infinite" "nan" "empty"))
+          (should (equal (cdr (assoc id rows)) (concat "  ✓ " id))))
+        ;; Expected 80-character fields are derived from the literal escapes:
+        ;; nine prefix characters + seventy payload characters + one ellipsis.
+        (should (equal (cdr (assoc "bounded" rows))
+                       (concat "  ✗ N\\n\\x01 arg\\n\\x01" (make-string 70 ?a) "… 1.5s $0.0022"
+                               " — err\\r\\x02" (make-string 70 ?e) "…")))
+        (should (seq-every-p (lambda (row) (not (string-match-p "[\n\r\1\2]" (cdr row)))) rows)))
+      (should (string-match-p "Full output: /tmp/FULL-OUTPUT" (buffer-string)))
+      (should-not (string-match-p "PARENT-15" (buffer-string)))
+      (should (= 1 (pilish-test--count-matches "/tmp/FULL-OUTPUT" (buffer-string))))
+      (pilish-test--nested-tab "p" 'output)
+      (should (string-match-p "KEEP-METADATA" (buffer-string)))
+      (should-not (string-match-p "\"calls\"\\|\"fullOutputPath\"" (buffer-string)))
+      (should (= 1 (pilish-test--count-matches "/tmp/FULL-OUTPUT" (buffer-string))))
+      (should (equal details (plist-get (pilish--tool-block-result root) :details)))
+      (pilish--merge-codemode-calls root "not an array")
+      (pilish--merge-codemode-calls root [(:id "good" :name "read" :status "running"
+                                        :args 7 :durationMs -1 :cost [] :error [])])
+      (pilish--redraw-compound-tool root)
+      (should (equal (cdr (assoc "good" (pilish-test--nested-summary-lines "p"))) "  ✓ read"))
+      (should (= 8 (length (pilish-test--nested-summary-lines "p"))))))
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 100))
+      (pilish-test--nested-event
+       "tool_execution_start" "generic" nil :toolName "runner" :args '(:job "generic"))
+      (let ((block (pilish--tool-block-get "generic")))
+        (pilish-test--nested-event
+         "tool_execution_end" "generic" nil :toolName "runner" :isError nil
+         :result '(:content [(:type "text" :text "GENERIC-OUTPUT")]
+                   :details (:calls [(:id "not-a-child" :name "read" :status "ok")])))
+        (should (string-match-p "\"calls\":\\|not-a-child" (buffer-string)))
+        (should-not (pilish--tool-block-compound-p block))
+        (should-not (pilish--tool-block-nested-calls block))
+        (should-not (pilish-test--nested-summary-lines "generic"))))))
+
+(ert-deftest pilish-test-codemode-folds-and-cold-script-survive-late-refresh ()
+  "Refresh and cooling preserve independent visible sections and script positions."
+  ;; Script collapse must map retained source rows, not wrapper prefixes;
+  ;; cooling must freeze every displayed section, not just the first fence.
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (switch-to-buffer (current-buffer))
+      (let ((script "\nconst marker = \"SCRIPT-POINT\";\nconst fence = \"```\";\nlet n = 0;\nn += 1;\nn += 2;\nn += 3;\nn += 4;\nn += 5;\nn += 6;\nn += 7;\nn += 8;\ntext(\"SCRIPT-HIDDEN\");")
+            (parent (mapconcat (lambda (n) (format "PARENT-%02d" n)) (number-sequence 1 15) "\n")))
+        (cl-letf (((symbol-function 'pilish--chat-display-width) (lambda () 80)))
+          (pilish-test--nested-event
+           "tool_execution_start" "p" nil :toolName "codemode" :args (list :code script))
+          (dotimes (index 12)
+            (let ((id (format "c%d" index)))
+              (pilish-test--nested-event
+               "tool_execution_end" id "p" :toolName "read" :isError nil
+               :result (list :content (vector (list :type "text" :text (format "CHILD-%02d" index)))))))
+          (pilish-test--nested-event
+           "tool_execution_start" "late" "p" :toolName "read" :args '(:path "late.el"))
+          (pilish-test--nested-event
+           "tool_execution_update" "p" nil
+           :partialResult (list :content (vector (list :type "text" :text parent))))
+          (pilish-test--flush-tool-updates)
+          (dolist (section '(script output children (child . "c0")))
+            (pilish-test--nested-tab "p" section))
+          (let* ((root (pilish--nested-tool-owner "p"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (child (pilish--nested-call-get root "c0"))
+                 (folds (copy-tree (pilish--tool-block-folds root)))
+                 (details '(:calls [(:id "c0" :name "read" :status "ok" :args "preview"
+                                    :error "raw metadata" :cost 0.002)])))
+            (goto-char (point-min))
+            (search-forward "SCRIPT-POINT")
+            (goto-char (+ (match-beginning 0) 3))
+            (let ((offset (- (point) (marker-position (pilish--tool-block-header-end root)))))
+              (pilish-test--nested-event
+               "tool_execution_update" "p" nil :partialResult (list :content [] :details details))
+              (pilish-test--flush-tool-updates)
+              (should (= offset (- (point) (marker-position (pilish--tool-block-header-end root)))))
+              (ert-info ("script point after details refresh")
+                (should (looking-at "IPT-POINT"))))
+            (should (equal folds (pilish--tool-block-folds root)))
+            (should (string-match-p "PARENT-15" (buffer-string)))
+            (should (string-match-p "CHILD-00" (buffer-string)))
+            (should-not (string-match-p "CHILD-01" (buffer-string)))
+            ;; Collapse while point is in a retained row after a leading blank.
+            (let ((button (pilish--find-toggle-button-in-region
+                           (overlay-start overlay) (overlay-end overlay) 'script)))
+              (should button)
+              (button-activate button))
+            (ert-info ("script point after collapse")
+              (should (looking-at "IPT-POINT")))
+            (should (save-excursion
+                      (goto-char (window-point (selected-window)))
+                      (looking-at "IPT-POINT")))
+            (should-not (string-match-p "SCRIPT-HIDDEN" (buffer-string)))
+            (pilish-test--nested-event
+             "tool_execution_end" "p" nil :toolName "codemode" :isError nil
+             :result (list :content (vector (list :type "text" :text parent)) :details details))
+            (pilish-test--nested-event
+             "tool_execution_end" "late" "p" :toolName "read" :isError nil
+             :result '(:content [(:type "text" :text "LATE-CONTENT")]))
+            (ert-info ("script point after late end")
+              (should (looking-at "IPT-POINT")))
+            (should (equal (remove 'script folds) (pilish--tool-block-folds root)))
+            (should (= 13 (length (pilish-test--nested-summary-lines "p"))))
+            (should-not (string-match-p "LATE-CONTENT" (buffer-string)))
+            (let ((visible (pilish--visible-text (point-min) (point-max))))
+              (should (pilish--cool-tool-overlay-preserving-view overlay))
+              (should (string-match-p "SCRIPT-POINT" visible)))
+            (should (string-match-p "SCRIPT-POINT" (buffer-string)))
+            (should (string-match-p "PARENT-15" (buffer-string)))
+            (should (string-match-p "CHILD-00" (buffer-string)))
+            (should-not (string-match-p "SCRIPT-HIDDEN\\|CHILD-01\\|LATE-CONTENT\\|javascript" (buffer-string)))
+            (should (= 13 (length (pilish-test--nested-summary-lines "p"))))
+            (should-not (text-property-not-all (point-min) (point-max) 'button nil))
+            (should-not (pilish-test--all-tool-overlays))
+            (should-not (pilish--tool-block-args root))
+            (should-not (pilish--tool-block-displayed-output root))
+            (should-not (pilish--nested-call-args-preview child))
+            (should-not (pilish--nested-call-error child))
+            (should (= 0 (hash-table-count pilish--nested-tool-owners))))))))
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 0))
+      (pilish-test--nested-event
+       "tool_execution_start" "zero" nil :toolName "codemode" :args '(:code "ZERO-SCRIPT\nHIDDEN"))
+      (pilish-test--nested-event
+       "tool_execution_update" "zero" nil
+       :partialResult '(:content [] :details (:calls [(:id "model" :name "models.classify" :status "ok")])))
+      (pilish-test--flush-tool-updates)
+      (should-not (string-match-p "ZERO-SCRIPT\\|models.classify" (buffer-string)))
+      (should (string-match-p (regexp-quote "... (2 more lines)") (buffer-string)))
+      (should (string-match-p (regexp-quote "... (1 earlier calls)") (buffer-string)))
+      (pilish-test--nested-tab "zero" 'script)
+      (should (string-match-p "ZERO-SCRIPT\nHIDDEN" (buffer-string)))
+      (should-not (pilish-test--nested-summary-lines "zero")))))
+
+(ert-deftest pilish-test-nested-updates-ingest-before-one-owner-paint ()
+  "Missed starts retain both execution obligations before one owner repaint."
+  ;; Dropping facts during latest-wins coalescing, painting per update, or
+  ;; cancelling compound paints at agent_end each breaks this contract.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "root" nil :toolName "runner" :args '(:job "parent"))
+    (pilish-test--nested-event
+     "tool_execution_update" "root" nil
+     :partialResult '(:content [(:type "text" :text "INITIAL-PARENT")]))
+    (let ((root (pilish--tool-block-get "root"))
+          (before (buffer-string)))
+      (should (equal (plist-get (pilish--tool-block-result root) :content)
+                     [(:type "text" :text "INITIAL-PARENT")]))
+      (dolist (id '("one" "two"))
+        (pilish-test--nested-event
+         "tool_execution_update" id "root" :toolName "read" :args (list :path id)
+         :partialResult '(:content [(:type "text" :text "not a final result")])))
+      (should (equal before (buffer-string)))
+      (should (equal (plist-get (pilish--tool-block-result root) :content)
+                     [(:type "text" :text "INITIAL-PARENT")]))
+      (should (equal (mapcar #'pilish--nested-call-id
+                            (pilish--tool-block-nested-calls root)) '("one" "two")))
+      (dolist (id '("one" "two"))
+        (let ((call (pilish--nested-call-get root id)))
+          (should (equal (pilish--nested-call-arguments call) (list :path id)))
+          (should (pilish--nested-call-pending-end-p call))
+          (should-not (pilish--nested-call-duration-ms call))
+          (should-not (pilish--nested-call-result call))))
+      (pilish-test--nested-event
+       "tool_execution_update" "root" nil
+       :partialResult '(:content [(:type "text" :text "PARENT-PARTIAL")]))
+      (should (equal (plist-get (pilish--tool-block-result root) :content)
+                     [(:type "text" :text "PARENT-PARTIAL")]))
+      (should (equal before (buffer-string)))
+      (should (= 1 (length pilish--pending-tool-updates)))
+      (should (eq root (cdr (assoc "root" pilish--pending-tool-updates))))
+      (let ((timer pilish--tool-update-flush-timer))
+        (should (timerp timer))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (should (eq timer pilish--tool-update-flush-timer))
+        (should (= 1 (length pilish--pending-tool-updates)))
+        (cancel-timer timer))
+      (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+        (pilish--flush-tool-updates (current-buffer)))
+      (should (equal (pilish-test--nested-summary-lines "root")
+                     '(("one" . "  … read {\"path\":\"one\"}")
+                       ("two" . "  … read {\"path\":\"two\"}"))))
+      (pilish-test--nested-event
+       "tool_execution_update" "one" "root" :toolName "read" :args '(:path "stale")
+       :partialResult '(:content [(:type "text" :text "stale preview")]))
+      (pilish-test--nested-event
+       "tool_execution_end" "one" "root" :toolName "read" :isError nil
+       :result '(:content [(:type "text" :text "authoritative")]))
+      (should-not (assoc "root" pilish--pending-tool-updates))
+      (should (equal (pilish-test--nested-summary-lines "root")
+                     '(("one" . "  ✓ read {\"path\":\"one\"}")
+                       ("two" . "  … read {\"path\":\"two\"}"))))
+      (should-not (string-match-p "stale preview" (buffer-string)))
+      (should (string-match-p "PARENT-PARTIAL" (buffer-string)))
+      (should (pilish--nested-pending-p root)))))
+
+(defun pilish-test--nested-tab (root-id section)
+  "Use public TAB on ROOT-ID's SECTION, or its header when SECTION is nil."
+  (let* ((root (pilish--nested-tool-owner root-id))
+         (overlay (pilish--tool-block-overlay root))
+         (position (overlay-start overlay)))
+    (when section
+      (setq position (text-property-any
+                      (marker-position (pilish--tool-block-header-end root))
+                      (overlay-end overlay) 'pilish-tool-section section))
+      ;; `text-property-any' uses eq, while child section keys are conses.
+      (unless position
+        (setq position (marker-position (pilish--tool-block-header-end root)))
+        (while (and (< position (overlay-end overlay))
+                    (not (equal section (get-text-property position 'pilish-tool-section))))
+          (setq position (next-single-property-change
+                          position 'pilish-tool-section nil (overlay-end overlay))))))
+    (should (< position (overlay-end overlay)))
+    (goto-char position)
+    (pilish-toggle-tool-section)))
+
+(ert-deftest pilish-test-nested-list-and-child-output-folds ()
+  "List, parent output, and received child outputs have independent folds."
+  ;; A whole-body toggle, first-N list, or repaint-reset fold choice loses
+  ;; an open sibling or exposes output which the user has not opened.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 10) (now 10))
+      (cl-letf (((symbol-function 'current-time) (lambda () (seconds-to-time now))))
+        (pilish-test--nested-event
+         "tool_execution_start" "fold-root" nil :toolName "runner" :args '(:job "folds"))
+        (dotimes (index 12)
+          (let ((id (format "call-%02d" index)))
+            (pilish-test--nested-event
+             "tool_execution_start" id "fold-root" :toolName "read"
+             :args (list :path (format "child-%02d.el" index)))
+            (setq now (+ now 0.012))
+            (pilish-test--nested-event
+             "tool_execution_end" id "fold-root" :toolName "read" :isError nil
+             :result (list :content (vector (list :type "text" :text (format "SECRET-%02d" index)))))))
+        (pilish-test--nested-event
+         "tool_execution_end" "fold-root" nil :toolName "runner" :isError nil
+         :result (list :content (vector (list :type "text" :text
+                                              (mapconcat (lambda (i) (format "PARENT-%02d" i))
+                                                         (number-sequence 0 14) "\n")))))
+        (should (equal (mapcar #'car (pilish-test--nested-summary-lines "fold-root"))
+                       '("call-02" "call-03" "call-04" "call-05" "call-06"
+                         "call-07" "call-08" "call-09" "call-10" "call-11")))
+        (should (string-match-p (regexp-quote "... (2 earlier calls)") (buffer-string)))
+        (should-not (string-match-p "SECRET-" (buffer-string)))
+        (should-not (string-match-p "PARENT-14" (buffer-string)))
+        ;; Header TAB defaults to the list, not parent output.
+        (pilish-test--nested-tab "fold-root" nil)
+        (should (= 12 (length (pilish-test--nested-summary-lines "fold-root"))))
+        (let ((with-duration (cdr (car (pilish-test--nested-summary-lines "fold-root"))))
+              (without-duration (cdr (car (pilish-test--nested-summary-lines "fold-root" t)))))
+          (should (equal with-duration "  ✓ read {\"path\":\"child-00.el\"} 12ms"))
+          (should (equal without-duration "  ✓ read {\"path\":\"child-00.el\"}"))
+          (should-not (string-match-p (regexp-opt '("output" "earlier" "[-]")) with-duration)))
+        (pilish-test--nested-tab "fold-root" '(child . "call-00"))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (should-not (string-match-p "SECRET-01" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" 'output)
+        (should (string-match-p "PARENT-14" (buffer-string)))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (pilish-test--nested-event
+         "tool_execution_update" "repaint-child" "fold-root" :toolName "read"
+         :args '(:path "repaint.el") :partialResult '(:content []))
+        (should (eq (pilish--nested-tool-owner "fold-root")
+                    (cdr (assoc "fold-root" pilish--pending-tool-updates))))
+        (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+          (pilish--flush-tool-updates (current-buffer)))
+        (should (= 13 (length (pilish-test--nested-summary-lines "fold-root"))))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (should (string-match-p "PARENT-14" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" 'output)
+        (should-not (string-match-p "PARENT-14" (buffer-string)))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" '(child . "call-00"))
+        (should-not (string-match-p "SECRET-00" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" 'children)
+        (let ((pilish-tool-preview-lines 0))
+          (pilish-test--nested-event
+           "tool_execution_start" "pending" "fold-root" :toolName "read" :args '(:path "pending.el"))
+          (should-not (pilish-test--nested-summary-lines "fold-root"))
+          (should (string-match-p (regexp-quote "... (14 earlier calls)") (buffer-string)))
+          (should (string-match-p (regexp-quote "... (15 more lines)") (buffer-string)))
+          (pilish-test--nested-tab "fold-root" 'children)
+          (should (= 14 (length (pilish-test--nested-summary-lines "fold-root"))))
+          (let ((text (buffer-string)))
+            (pilish-test--nested-tab "fold-root" '(child . "pending"))
+            (should (equal text (buffer-string)))))
+        (should (= 1 (length (pilish-test--all-tool-overlays))))))))
+
+(defun pilish-test--nested-markup-summary ()
+  "Render a completed compound tool with Markdown-bearing child metadata."
+  (pilish-test--nested-event
+   "tool_execution_start" "literal-root" nil :toolName "runner" :args '(:job "literal"))
+  (pilish-test--nested-event
+   "tool_execution_start" "literal-child" "literal-root" :toolName "bash"
+   :args '(:command "echo **danger** [target](somewhere) `quoted`"))
+  (pilish-test--nested-event
+   "tool_execution_end" "literal-child" "literal-root" :toolName "bash" :isError t
+   :result '(:content [(:type "text" :text "denied **retry** [help](elsewhere) `later`")]))
+  (pilish-test--nested-event
+   "tool_execution_end" "literal-root" nil :toolName "runner" :isError nil
+   :result '(:content [(:type "text" :text "PARENT-OUTPUT")]))
+  (pilish--tool-block-overlay (pilish--nested-tool-owner "literal-root")))
+
+(ert-deftest pilish-test-nested-summary-arguments-decode-json-utf8 ()
+  "Native JSON bytes must display as the received Unicode argument characters."
+  ;; Passing json-serialize's unibyte UTF-8 output to character escaping
+  ;; corrupts non-ASCII event/saved arguments, unlike decoded details previews.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "unicode-root" nil :toolName "runner" :args '(:job "unicode"))
+    (pilish-test--nested-event
+     "tool_execution_start" "unicode-child" "unicode-root" :toolName "bash"
+     :args '(:command "echo café λ 😀"))
+    (pilish-test--nested-event
+     "tool_execution_end" "unicode-child" "unicode-root" :toolName "bash" :isError :false
+     :result '(:content [(:type "text" :text "DONE")]))
+    (font-lock-ensure)
+    (should (equal (pilish-test--nested-summary-lines "unicode-root" t)
+                   '(("unicode-child" . "  ✓ bash {\"command\":\"echo café λ 😀\"}"))))))
+
+(ert-deftest pilish-test-nested-summary-metadata-stays-literal-after-refontification ()
+  "Real Markdown fontification cannot hide or activate child argument/error text."
+  ;; Losing literal-text protection changes the received command/error and
+  ;; gives its apparent links actions unrelated to compound output folds.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-markup-summary)
+    (pilish--append-to-chat "\nNormal **rendered** [outside](https://example.org/outside).\n")
+    (dotimes (pass 3)
+      (if (= pass 2)
+          ;; md-ts expands this tiny request to the entire metadata line.
+          (let ((start (text-property-any (point-min) (point-max) 'pilish-nested-summary t)))
+            (font-lock-fontify-region start (1+ start)))
+        (font-lock-flush)
+        (font-lock-ensure))
+      (save-excursion
+        (goto-char (point-min))
+        (search-forward "outside")
+        (should (button-at (match-beginning 0))))
+      (should (equal (pilish-test--nested-summary-lines "literal-root" t)
+                     '(("literal-child" . "  ✗ bash {\"command\":\"echo **danger** [target](somewhere) `quoted`\"} — denied **retry** [help](elsewhere) `later`"))))
+      (let* ((start (text-property-any (point-min) (point-max) 'pilish-nested-summary t))
+             (end (next-single-property-change start 'pilish-nested-summary nil (point-max))))
+        (should-not (text-property-not-all start end 'button nil))))))
+
+(ert-deftest pilish-test-codemode-full-output-path-stays-literal-after-refontification ()
+  "Native fontification must not change or activate a full-output path."
+  ;; Treating this literal footer as Markdown hides pathname characters and
+  ;; invents links, both in the hot block and after its overlay is released.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "path-root" nil :toolName "codemode" :args '(:code "text(1);"))
+    (pilish-test--nested-event
+     "tool_execution_end" "path-root" nil :toolName "codemode" :isError nil
+     :result `(:content [(:type "image" :mimeType "image/png" :data ,pilish-test--png-base64)]
+               :details (:fullOutputPath "/tmp/**cache**/[label](dest)/`raw`/pi-codemode.txt")))
+    (pilish--append-to-chat "\nNormal **rendered** [outside](https://example.org).\n")
+    (let ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "path-root")))
+          (image-display (get-text-property (car (pilish-test--image-preview-positions)) 'display)))
+      (when (display-images-p) (should (eq (car image-display) 'image)))
+      (dotimes (pass 4)
+        (when (= pass 2) (should (pilish--cool-tool-overlay overlay)))
+        (font-lock-flush)
+        (font-lock-ensure)
+        (let* ((start (text-property-any (point-min) (point-max) 'pilish-tool-section 'full-output))
+               (end (next-single-property-change start 'pilish-tool-section nil (point-max))))
+          (should (equal (pilish--visible-text start end)
+                         "Full output: /tmp/**cache**/[label](dest)/`raw`/pi-codemode.txt\n"))
+          (should-not (text-property-not-all start end 'button nil))
+          ;; md-ts expands a one-character refontification to the whole line.
+          (font-lock-fontify-region (+ start 16) (+ start 17))
+          (should (equal (pilish--visible-text start end)
+                         "Full output: /tmp/**cache**/[label](dest)/`raw`/pi-codemode.txt\n")))
+        (should (= 1 (length (pilish-test--image-preview-positions))))
+        (should (equal image-display (get-text-property (car (pilish-test--image-preview-positions)) 'display)))
+        (should (button-at (pilish-test--hover-pos "outside")))))))
+
+(ert-deftest pilish-test-nested-cold-summary-stays-literal-and-inert-after-refontification ()
+  "Cooling leaves literal metadata with no links after real refontification."
+  ;; Removing current buttons is insufficient when md-ts can recreate them.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((overlay (pilish-test--nested-markup-summary)))
+      (font-lock-ensure)
+      (should (pilish--cool-tool-overlay overlay)))
+    (dotimes (pass 3)
+      ;; Check the frozen display immediately and after repeated fontification.
+      (unless (= pass 0)
+        (font-lock-flush)
+        (font-lock-ensure))
+      (should-not (text-property-not-all (point-min) (point-max) 'button nil))
+      (should (equal (pilish-test--nested-summary-lines "literal-root" t)
+                     '(("literal-child" . "  ✗ bash {\"command\":\"echo **danger** [target](somewhere) `quoted`\"} — denied **retry** [help](elsewhere) `later`")))))))
+
+(defun pilish-test--nested-expansion-source-view
+    (section source first-line second-line &optional preview-at-tab)
+  "Expand SECTION containing SOURCE and preserve two readers' source positions.
+FIRST-LINE and SECOND-LINE are literal source rows retained by the preview.
+PREVIEW-AT-TAB changes the budget after painting, before the public fold."
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let ((pilish-tool-preview-lines 2))
+        (pilish-test--nested-event
+         "tool_execution_start" "expand-root" nil :toolName "codemode"
+         :args (list :code (if (eq section 'script) source "text(1);")))
+        (when (eq section 'output)
+          (pilish-test--nested-event
+           "tool_execution_end" "expand-root" nil :toolName "codemode" :isError :false
+           :result (list :content (vector (list :type "text" :text source)))))
+        (let ((selected (selected-window))
+              (other (split-window-right)))
+          (set-window-buffer other (current-buffer))
+          (goto-char (+ (pilish-test--hover-pos "SECOND") 2))
+          (set-window-start selected (pilish-test--hover-pos first-line) t)
+          (set-window-point other (1+ (pilish-test--hover-pos "SECOND")))
+          (set-window-start other (pilish-test--hover-pos second-line) t)
+          ;; Public TAB from surviving preview text, not a private redraw.
+          (when preview-at-tab (setq pilish-tool-preview-lines preview-at-tab))
+          (pilish-toggle-tool-section)
+          (should (= (point) (+ (pilish-test--hover-pos "SECOND") 2)))
+          (should (= (window-point selected) (point)))
+          (should (looking-at-p "COND"))
+          (should (= (window-start selected) (pilish-test--hover-pos first-line)))
+          (should (equal first-line (pilish-test--window-start-line selected)))
+          (should (= (window-point other) (1+ (pilish-test--hover-pos "SECOND"))))
+          (should (pilish-test--window-point-text-p other "ECOND"))
+          (should (= (window-start other) (pilish-test--hover-pos second-line)))
+          (should (equal second-line (pilish-test--window-start-line other)))
+          ;; Full expansion restores the source blanks and hidden rows too.
+          (should (string-match-p (regexp-quote source) (buffer-string)))
+          (when (string-match-p "```" source)
+            (should (string-match-p "^~~~" (buffer-string)))))))))
+
+(ert-deftest pilish-test-codemode-script-expansion-preserves-source-view ()
+  "Public expansion restores blanks without moving either script reader."
+  ;; Raw section offsets land before SECOND after the two blanks return.
+  (pilish-test--nested-expansion-source-view
+   'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);"
+   "const FIRST = 1;" "const SECOND = 2;"))
+
+(ert-deftest pilish-test-nested-output-expansion-preserves-source-view ()
+  "Public expansion restores blanks without moving either output reader."
+  (pilish-test--nested-expansion-source-view
+   'output "\nFIRST\n\nSECOND\nTHIRD" "FIRST" "SECOND"))
+
+(ert-deftest pilish-test-codemode-script-expansion-fence-change-preserves-source-view ()
+  "A different full script fence cannot change surviving content coordinates."
+  ;; Rendered-prefix comparison fails when hidden backticks require tildes.
+  (pilish-test--nested-expansion-source-view
+   'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);\n```"
+   "const FIRST = 1;" "const SECOND = 2;"))
+
+(ert-deftest pilish-test-nested-output-expansion-fence-change-preserves-source-view ()
+  "A different full output fence cannot change surviving content coordinates."
+  (pilish-test--nested-expansion-source-view
+   'output "\nFIRST\n\nSECOND\nTHIRD\n```" "FIRST" "SECOND"))
+
+(ert-deftest pilish-test-codemode-script-expansion-new-budget-preserves-source-view ()
+  "Expansion maps the painted rows, not a preview recomputed with a new budget."
+  ;; Recomputing only the new one-row preview cannot identify painted SECOND.
+  (pilish-test--nested-expansion-source-view
+   'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);"
+   "const FIRST = 1;" "const SECOND = 2;" 1))
+
+(defun pilish-test--codemode-resize-repaint-view (old-width new-width target &optional queued-p)
+  "Repaint a script at NEW-WIDTH after its OLD-WIDTH paint, reading TARGET.
+SECOND survives either projection; SIXTH disappears in the narrow preview.
+With QUEUED-P, resize hidden chat, reopen, then paint with input selected."
+  (let ((frame (selected-frame))
+        (width (frame-width))
+        (height (frame-height)))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (set-frame-size frame old-width 60)
+          (with-temp-buffer
+            (pilish-chat-mode)
+            (switch-to-buffer (current-buffer))
+            (let* ((chat (current-buffer))
+                   (pilish-tool-preview-lines 10)
+                   (lines (mapcar (lambda (name)
+                                    (concat "const " name " = \"" (make-string 80 ?x) "\";"))
+                                  '("FIRST" "SECOND" "THIRD" "FOURTH" "FIFTH" "SIXTH")))
+                   (source (concat "\n" (string-join lines "\n\n"))))
+              (pilish--append-to-chat "OLDER TURN\nunchanged prelude\n")
+              (pilish-test--nested-event
+               "tool_execution_start" "resize-root" nil :toolName "codemode" :args (list :code source))
+              (pilish-test--nested-event
+               "tool_execution_start" "resize-child" "resize-root" :toolName "read" :args '(:path "file.txt"))
+              (pilish--append-to-chat "\nNEWER TURN\nunchanged epilogue\n")
+              (should (eq (not (null (string-match-p (regexp-quote source) (buffer-string))))
+                          (= old-width 120)))
+              (let* ((root (pilish--nested-tool-owner "resize-root"))
+                     (overlay (pilish--tool-block-overlay root))
+                     (prefix (buffer-substring-no-properties (point-min) (overlay-start overlay)))
+                     (suffix (buffer-substring-no-properties (overlay-end overlay) (point-max)))
+                     (reader (selected-window))
+                     (other (split-window-below 20))
+                     (input-window (split-window other 20 'below)))
+                (set-window-buffer other chat)
+                (with-temp-buffer
+                  (pilish-input-mode)
+                  (insert "NEWER DRAFT")
+                  (goto-char 5)
+                  (let ((input (current-buffer)))
+                    (set-window-buffer input-window input)
+                    (when queued-p
+                      (select-window input-window)
+                      (set-window-buffer reader input)
+                      (set-window-buffer other input)
+                      (set-frame-size frame new-width 60)
+                      (set-window-buffer reader chat)
+                      (set-window-buffer other chat))
+                    (with-current-buffer chat
+                      (goto-char (+ 2 (pilish-test--hover-pos target)))
+                      (set-window-point reader (point))
+                      (set-window-start reader (pilish-test--hover-pos (concat "const " target)) t)
+                      (set-window-point other (1+ (pilish-test--hover-pos "SECOND")))
+                      (set-window-start other (pilish-test--hover-pos "const SECOND") t)
+                      (if queued-p
+                          (progn
+                            (let ((painted (buffer-string)))
+                              (pilish-test--nested-event
+                               "tool_execution_update" "resize-child" "resize-root"
+                               :partialResult '(:content [(:type "text" :text "PROGRESS")]))
+                              (should (equal painted (buffer-string))))
+                            (cancel-timer pilish--tool-update-flush-timer)
+                            (pilish--flush-tool-updates chat))
+                        (set-frame-size frame new-width 60)
+                        (pilish-test--nested-event
+                         "tool_execution_end" "resize-child" "resize-root" :toolName "read"
+                         :isError :false :result '(:content [])))
+                      (should (eq (not (null (string-match-p (regexp-quote source) (buffer-string))))
+                                  (= new-width 120)))
+                      (if (equal target "SIXTH")
+                          (let ((anchor (text-property-any (overlay-start overlay) (overlay-end overlay)
+                                                          'pilish-tool-section 'script)))
+                            (should-not (string-match-p "SIXTH" (buffer-string)))
+                            (should (= (point) anchor))
+                            (should (= (window-point reader) anchor))
+                            (should (= (window-start reader) anchor)))
+                        (should (= (point) (+ 2 (pilish-test--hover-pos "SECOND"))))
+                        (should (= (window-point reader) (point)))
+                        (should (pilish-test--window-point-text-p reader "COND"))
+                        (should (= (window-start reader) (pilish-test--hover-pos "const SECOND")))
+                        (should (equal (nth 1 lines) (pilish-test--window-start-line reader))))
+                      (should (= (window-point other) (1+ (pilish-test--hover-pos "SECOND"))))
+                      (should (pilish-test--window-point-text-p other "ECOND"))
+                      (should (= (window-start other) (pilish-test--hover-pos "const SECOND")))
+                      (should (equal (nth 1 lines) (pilish-test--window-start-line other)))
+                      (should (equal prefix (buffer-substring-no-properties (point-min) (overlay-start overlay))))
+                      (should (equal suffix (buffer-substring-no-properties (overlay-end overlay) (point-max)))))
+                    (should (eq (selected-window) (if queued-p input-window reader)))
+                    (should (eq (window-buffer input-window) input))
+                    (should (= (window-point input-window) 5))
+                    (should (equal (buffer-string) "NEWER DRAFT"))))))))
+      (set-frame-size frame width height))))
+
+(ert-deftest pilish-test-codemode-script-child-end-after-widening-preserves-source-view ()
+  "An ordinary child end maps the painted preview onto full source, without TAB."
+  ;; Displayed row indices put SECOND in FIRST when the source blanks return.
+  (pilish-test--codemode-resize-repaint-view 80 120 "SECOND"))
+
+(ert-deftest pilish-test-codemode-script-queued-repaint-after-narrowing-preserves-source-view ()
+  "Reopened chat maps full source into its preview with the draft still selected."
+  ;; Old geometry belongs to the wide paint, not the reopened window's width.
+  (pilish-test--codemode-resize-repaint-view 120 80 "SECOND" t))
+
+(ert-deftest pilish-test-codemode-script-child-end-after-narrowing-clamps-hidden-source ()
+  "Only vanished script text clamps; the other reader stays on surviving text."
+  (pilish-test--codemode-resize-repaint-view 120 80 "SIXTH"))
+
+(defun pilish-test--nested-collapse-to-full-source-view (section budget-change-p)
+  "Collapse SECTION after it fits and preserve both readers' source positions.
+BUDGET-CHANGE-P increases the preview budget instead of the display width."
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let* ((pilish-tool-preview-lines 2)
+             (width 30)
+             (first "const FIRST = 111111111111111111111111111111;")
+             (second "const SECOND = 222222222222222222222222222222;")
+             (source (concat "\n" first "\n\n" second)))
+        (cl-letf (((symbol-function 'pilish--chat-display-width) (lambda () width)))
+          (pilish--append-to-chat "OLDER TURN\nunchanged prelude\n")
+          (pilish-test--nested-event
+           "tool_execution_start" "fit-root" nil :toolName "codemode"
+           :args (list :code (if (eq section 'script) source "text(1);")))
+          (when (eq section 'output)
+            (pilish-test--nested-event
+             "tool_execution_end" "fit-root" nil :toolName "codemode" :isError :false
+             :result (list :content (vector (list :type "text" :text source)))))
+          (should-not (string-match-p "SECOND" (buffer-string)))
+          (goto-char (+ (pilish-test--hover-pos "FIRST") 2))
+          (pilish-toggle-tool-section)
+          (should (string-match-p (regexp-quote source) (buffer-string)))
+          (pilish--append-to-chat "\nNEWER TURN\nunchanged epilogue\n")
+          (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "fit-root")))
+                 (prefix (buffer-substring-no-properties (point-min) (overlay-start overlay)))
+                 (suffix (buffer-substring-no-properties (overlay-end overlay) (point-max)))
+                 (selected (selected-window))
+                 (other (split-window-right)))
+            (set-window-buffer other (current-buffer))
+            (goto-char (+ (pilish-test--hover-pos "SECOND") 2))
+            (set-window-start selected (pilish-test--hover-pos first) t)
+            (set-window-point other (1+ (pilish-test--hover-pos "FIRST")))
+            (set-window-start other (pilish-test--hover-pos second) t)
+            (if budget-change-p (setq pilish-tool-preview-lines 4) (setq width 120))
+            ;; No rows are hidden now: collapse inserts full source, not a
+            ;; nonblank preview.  Its row identities must include the blanks.
+            (pilish-toggle-tool-section)
+            (should (string-match-p (regexp-quote source) (buffer-string)))
+            (should-not (pilish--find-toggle-button-in-region
+                         (overlay-start overlay) (overlay-end overlay) section))
+            (should (= (point) (+ (pilish-test--hover-pos "SECOND") 2)))
+            (should (= (window-point selected) (point)))
+            (should (looking-at-p "COND"))
+            (should (= (window-start selected) (pilish-test--hover-pos first)))
+            (should (equal first (pilish-test--window-start-line selected)))
+            (should (= (window-point other) (1+ (pilish-test--hover-pos "FIRST"))))
+            (should (pilish-test--window-point-text-p other "IRST"))
+            (should (= (window-start other) (pilish-test--hover-pos second)))
+            (should (equal second (pilish-test--window-start-line other)))
+            (should (equal prefix (buffer-substring-no-properties (point-min) (overlay-start overlay))))
+            (should (equal suffix (buffer-substring-no-properties (overlay-end overlay) (point-max))))))))))
+
+(ert-deftest pilish-test-codemode-script-collapse-after-widening-preserves-full-source-view ()
+  "Collapse after widening keeps full script rows, blanks and both readers."
+  ;; Assigning preview identities to full source raises args-out-of-range.
+  (pilish-test--nested-collapse-to-full-source-view 'script nil))
+
+(ert-deftest pilish-test-nested-output-collapse-after-widening-preserves-full-source-view ()
+  "Parent output also keeps full source coordinates when the preview fits."
+  (pilish-test--nested-collapse-to-full-source-view 'output nil))
+
+(ert-deftest pilish-test-codemode-script-collapse-after-budget-change-preserves-full-source-view ()
+  "An increased budget cannot make full script rows use preview identities."
+  (pilish-test--nested-collapse-to-full-source-view 'script t))
+
+(ert-deftest pilish-test-nested-output-expansion-before-pending-update-keeps-displayed-snapshot ()
+  "Expansion uses painted source rows while a newer parent result awaits paint."
+  ;; Folding retained facts instead of the displayed snapshot either maps
+  ;; SECOND onto unrelated newer text or indexes rows which were never painted.
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let ((pilish-tool-preview-lines 2))
+        (pilish-test--nested-event
+         "tool_execution_start" "pending-root" nil :toolName "runner" :args '(:job "pending"))
+        (pilish-test--nested-event
+         "tool_execution_start" "stable-child" "pending-root" :toolName "read" :args '(:path "stable.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "stable-child" "pending-root" :toolName "read" :isError :false
+         :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
+        (pilish-test--nested-event
+         "tool_execution_update" "pending-root" nil
+         :partialResult '(:content [(:type "text" :text "\nFIRST\n\nSECOND\nTHIRD")]))
+        (cancel-timer pilish--tool-update-flush-timer)
+        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+          (pilish--flush-tool-updates (current-buffer)))
+        (pilish-test--nested-tab "pending-root" '(child . "stable-child"))
+        (let ((selected (selected-window))
+              (other (split-window-right)))
+          (set-window-buffer other (current-buffer))
+          (goto-char (+ (pilish-test--hover-pos "SECOND") 2))
+          (set-window-start selected (pilish-test--hover-pos "SECOND") t)
+          (set-window-point other (+ (pilish-test--hover-pos "UNCHANGED-OFFSET") 3))
+          (set-window-start other (pilish-test--hover-pos "UNCHANGED-OFFSET") t)
+          (let ((displayed (buffer-substring-no-properties (point-min) (point-max))))
+            (pilish-test--nested-event
+             "tool_execution_update" "pending-root" nil
+             :partialResult '(:content [(:type "text" :text "\n\nLATEST\nNEW-SECOND\nNEW-HIDDEN")]))
+            (should (equal displayed (buffer-substring-no-properties (point-min) (point-max)))))
+          (pilish-toggle-tool-section)
+          (should (string-match-p "\nFIRST\n\nSECOND\nTHIRD" (buffer-string)))
+          (should-not (string-match-p "LATEST\\|NEW-" (buffer-string)))
+          (should (= (point) (+ (pilish-test--hover-pos "SECOND") 2)))
+          (should (= (window-point selected) (point)))
+          (should (= (window-start selected) (pilish-test--hover-pos "SECOND")))
+          (should (pilish-test--window-point-text-p other "HANGED-OFFSET"))
+          (should (= (window-start other) (pilish-test--hover-pos "UNCHANGED-OFFSET")))
+          ;; The ordinary queued paint still applies latest facts with the
+          ;; user's open fold.  Its last row must not become a hidden preview.
+          (cancel-timer pilish--tool-update-flush-timer)
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish--flush-tool-updates (current-buffer)))
+          (should (string-match-p "\n\nLATEST\nNEW-SECOND\nNEW-HIDDEN" (buffer-string)))
+          (should-not (string-match-p "FIRST\\|THIRD" (buffer-string)))
+          (should (pilish-test--window-point-text-p other "HANGED-OFFSET"))
+          (should (= (window-start other) (pilish-test--hover-pos "UNCHANGED-OFFSET")))
+          (pilish-test--nested-tab "pending-root" 'output)
+          (should (string-match-p "LATEST\nNEW-SECOND" (buffer-string)))
+          (should-not (string-match-p "NEW-HIDDEN" (buffer-string))))))))
+
+(defun pilish-test--nested-summary-enrichment-output-view (saved-duration)
+  "Enrich a received child's duration to SAVED-DURATION without moving its reader."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (let ((chat (current-buffer))
+            (reader (selected-window))
+            (now 10.0))
+        (switch-to-buffer chat)
+        (pilish-chat-mode)
+        (pilish--append-to-chat "OLDER TURN\nunchanged prelude\n")
+        (cl-letf (((symbol-function 'current-time) (lambda () (seconds-to-time now))))
+          (pilish-test--nested-event
+           "tool_execution_start" "batch" nil :toolName "batch_read" :args '(:files ["fast.txt" "slow.txt"]))
+          (pilish-test--nested-event
+           "tool_execution_start" "fast" "batch" :toolName "read" :args '(:path "fast.txt"))
+          (setq now 10.009)
+          (pilish-test--nested-event
+           "tool_execution_end" "fast" "batch" :toolName "read" :isError :false
+           :result '(:content [(:type "text" :text "FIRST\nREADER-TEXT\nTHIRD")]))
+          (pilish-test--nested-event
+           "tool_execution_start" "slow" "batch" :toolName "read" :args '(:path "slow.txt")))
+        (pilish-test--nested-tab "batch" '(child . "fast"))
+        (should (string-match-p "9ms" (cdr (assoc "fast" (pilish-test--nested-summary-lines "batch")))))
+        (goto-char (+ (pilish-test--hover-pos "READER-TEXT") 4))
+        (set-window-start reader (pilish-test--hover-pos "READER-TEXT") t)
+        (let ((input-window (split-window-below)))
+          (with-temp-buffer
+            (let ((input (current-buffer)))
+              (pilish-input-mode)
+              (insert "NEWER DRAFT")
+              (set-window-buffer input-window input)
+              (select-window input-window)
+              (with-current-buffer chat
+                (pilish-test--nested-event
+                 "tool_execution_end" "slow" "batch" :toolName "read" :isError :false
+                 :result '(:content [(:type "text" :text "SLOW-DONE")]))
+                (pilish-test--nested-event
+                 "tool_execution_end" "batch" nil :toolName "batch_read" :isError :false
+                 :result '(:content [(:type "text" :text "ALL-DONE")]))
+                (pilish--append-to-chat "NEWER TURN\nunchanged epilogue\n")
+                (should (pilish-test--window-point-text-p reader "ER-TEXT"))
+                (should (= (window-start reader) (pilish-test--hover-pos "READER-TEXT")))
+                (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "batch")))
+                       (prefix (buffer-substring-no-properties (point-min) (overlay-start overlay)))
+                       (suffix (buffer-substring-no-properties (overlay-end overlay) (point-max))))
+                  ;; Pi persists the saved snapshot after the live parent end.
+                  (pilish--handle-display-event
+                   `(:type "message_end" :message
+                     (:role "toolResult" :toolCallId "batch" :toolName "batch_read"
+                      :content [(:type "text" :text "ALL-DONE")] :isError :false :timestamp 1784817120000
+                      :nestedCalls (:complete t :calls
+                                    [(:id "fast" :name "read" :status "ok" :arguments (:path "fast.txt")
+                                      :durationMs ,saved-duration)
+                                     (:id "slow" :name "read" :status "ok" :arguments (:path "slow.txt")
+                                      :durationMs 5000)]))))
+                  ;; The truthful duration must grow; suppressing metadata is
+                  ;; not an acceptable way to preserve output coordinates.
+                  (should (string-match-p (format " %dms" saved-duration)
+                                          (cdr (assoc "fast" (pilish-test--nested-summary-lines "batch")))))
+                  (should (= (window-point reader) (+ (pilish-test--hover-pos "READER-TEXT") 4)))
+                  (should (pilish-test--window-point-text-p reader "ER-TEXT"))
+                  (should (= (window-start reader) (pilish-test--hover-pos "READER-TEXT")))
+                  (should (equal "READER-TEXT" (pilish-test--window-start-line reader)))
+                  (should (equal prefix (buffer-substring-no-properties (point-min) (overlay-start overlay))))
+                  (should (equal suffix (buffer-substring-no-properties (overlay-end overlay) (point-max))))))
+              (should (eq (selected-window) input-window))
+              (should (eq (window-buffer input-window) input))
+              (should (equal (buffer-string) "NEWER DRAFT")))))))))
+
+(ert-deftest pilish-test-nested-summary-enrichment-preserves-output-view ()
+  "A 9ms to 10ms saved duration leaves the input-selected output reader in place."
+  ;; Offsets from the summary start shift readers when that summary grows.
+  (pilish-test--nested-summary-enrichment-output-view 10))
+
+(ert-deftest pilish-test-nested-summary-enrichment-wider-duration-preserves-output-view ()
+  "A 9ms to 953ms saved duration also keeps the exact output character and row."
+  (pilish-test--nested-summary-enrichment-output-view 953))
+
+(defun pilish-test--nested-short-output-collapse-view (output target retained-p)
+  "Collapse OUTPUT with point on TARGET and check both readers' views.
+With RETAINED-P, point must stay on FIRST; otherwise it must clamp to the
+section anchor.  Preview text and an expanded sibling retain their views."
+  (let ((buffer (generate-new-buffer " *pi-nested-short-collapse*"))
+        (pilish-quit-without-confirmation t)
+        (pilish-tool-preview-lines 1))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (pilish-chat-mode)
+          (pilish-test--nested-event
+           "tool_execution_start" "short-root" nil :toolName "runner" :args '(:job "short"))
+          (pilish-test--nested-event
+           "tool_execution_start" "stable-child" "short-root" :toolName "read" :args '(:path "stable.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" "stable-child" "short-root" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
+          (pilish-test--nested-event
+           "tool_execution_end" "short-root" nil :toolName "runner" :isError nil
+           :result (list :content (vector (list :type "text" :text output))))
+          (pilish-test--nested-tab "short-root" '(child . "stable-child"))
+          (pilish-test--nested-tab "short-root" 'output)
+          (let* ((root (pilish--nested-tool-owner "short-root"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (start (marker-position (pilish--tool-block-header-end root)))
+                 (old-output (assq 'output (pilish--tool-section-bounds start (overlay-end overlay))))
+                 (selected (selected-window))
+                 (other (split-window-right)))
+            (set-window-buffer other buffer)
+            (cl-labels ((position (text)
+                          (save-excursion (goto-char (point-min)) (search-forward text) (match-beginning 0)))
+                        (collapse ()
+                          (button-activate
+                           (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))))
+              (goto-char (position target))
+              (set-window-start selected (position "FIRST") t)
+              (set-window-point other (position "UNCHANGED-OFFSET"))
+              (set-window-start other (position "UNCHANGED-OFFSET") t)
+              (collapse)
+              (let ((new-output (assq 'output (pilish--tool-section-bounds start (overlay-end overlay)))))
+                (should (> (- (nth 2 new-output) (nth 1 new-output))
+                           (- (nth 2 old-output) (nth 1 old-output)))))
+              (let ((expected (if retained-p (position "FIRST") start)))
+                (should (= (point) expected))
+                (should (= (window-point selected) expected)))
+              (should (= (window-start selected) (position "FIRST")))
+              (should (equal "FIRST" (pilish-test--window-start-line selected)))
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+              (should (= (window-start other) (position "UNCHANGED-OFFSET")))
+              (should (equal "UNCHANGED-OFFSET" (pilish-test--window-start-line other)))
+              ;; Retained source text also keeps an exact interior offset.
+              (pilish-test--nested-tab "short-root" 'output)
+              (goto-char (+ (position "FIRST") 2))
+              (set-window-start selected (position "FIRST") t)
+              (collapse)
+              (should (looking-at-p "RST"))
+              (should (pilish-test--window-point-text-p selected "RST"))
+              (should (= (window-start selected) (position "FIRST")))
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET")))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest pilish-test-nested-short-output-collapse-clamps-removed-content ()
+  "Public collapse clamps hidden text even when its replacement is longer."
+  ;; A new-section-length check maps HIDDEN into the closing fence instead
+  ;; of the section anchor.  Retained preview text and siblings must not move.
+  (pilish-test--nested-short-output-collapse-view "FIRST\nHIDDEN" "HIDDEN" nil))
+
+(ert-deftest pilish-test-nested-output-collapse-clamps-fence-prefix-collision ()
+  "A removed backtick is content, not part of the replacement closing fence."
+  ;; Comparing rendered prefixes mistakes the hidden backtick for a retained
+  ;; fence character and leaves point on the replacement closing fence.
+  (pilish-test--nested-short-output-collapse-view "FIRST\n`HIDDEN" "`HIDDEN" nil))
+
+(ert-deftest pilish-test-nested-output-collapse-retains-content-across-fence-change ()
+  "Retained content keeps point and window start when the wrapper fence changes."
+  ;; The full output needs a tilde fence; its FIRST-only preview needs a
+  ;; backtick fence.  A rendered-prefix limit incorrectly clamps FIRST.
+  (pilish-test--nested-short-output-collapse-view "FIRST\n```" "FIRST" t))
+
+(ert-deftest pilish-test-nested-output-collapse-retains-content-after-leading-blank ()
+  "Retained source content follows the preview's original-line map."
+  ;; A preview omits the leading blank line, so FIRST survives at a different
+  ;; section offset even though the wrapper fence does not change.
+  (pilish-test--nested-short-output-collapse-view "\nFIRST\nHIDDEN" "FIRST" t))
+
+(defun pilish-test--nested-output-collapse-before-update (latest-output latest-preview)
+  "Collapse displayed output before LATEST-OUTPUT's queued paint.
+The fold keeps FIRST and both readers' views; the paint then shows the
+literal LATEST-PREVIEW without losing the closed fold."
+  (let ((buffer (generate-new-buffer " *pi-nested-pending-collapse*"))
+        (pilish-quit-without-confirmation t)
+        (pilish-tool-preview-lines 1))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (pilish-chat-mode)
+          (pilish-test--nested-event
+           "tool_execution_start" "pending-root" nil :toolName "runner" :args '(:job "pending"))
+          (pilish-test--nested-event
+           "tool_execution_start" "stable-child" "pending-root" :toolName "read" :args '(:path "stable.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" "stable-child" "pending-root" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
+          (pilish-test--nested-event
+           "tool_execution_update" "pending-root" nil
+           :partialResult '(:content [(:type "text" :text "FIRST\nOLD-HIDDEN")]))
+          (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish--flush-tool-updates buffer))
+          (pilish-test--nested-tab "pending-root" '(child . "stable-child"))
+          (pilish-test--nested-tab "pending-root" 'output)
+          (let* ((root (pilish--nested-tool-owner "pending-root"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (start (marker-position (pilish--tool-block-header-end root)))
+                 (selected (selected-window))
+                 (other (split-window-right)))
+            (set-window-buffer other buffer)
+            (cl-labels ((position (text)
+                          (save-excursion (goto-char start) (search-forward text) (match-beginning 0))))
+              (goto-char (+ (position "FIRST") 2))
+              (set-window-start selected (position "FIRST") t)
+              (set-window-point other (position "UNCHANGED-OFFSET"))
+              (set-window-start other (position "UNCHANGED-OFFSET") t)
+              (let ((displayed (buffer-substring-no-properties start (overlay-end overlay))))
+                ;; The event retains facts now but intentionally does not paint.
+                (pilish-test--nested-event
+                 "tool_execution_update" "pending-root" nil
+                 :partialResult (list :content (vector (list :type "text" :text latest-output))))
+                (should (equal displayed (buffer-substring-no-properties start (overlay-end overlay))))
+                (should (equal latest-output
+                               (pilish--extract-text-from-content
+                                (plist-get (pilish--tool-block-result root) :content)))))
+              (let ((timer pilish--tool-update-flush-timer))
+                (should (timerp timer))
+                (button-activate
+                 (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))
+                ;; A fold acts on the displayed snapshot, not unpainted facts.
+                (should (string-match-p "FIRST" (buffer-string)))
+                (should (= (point) (+ (position "FIRST") 2)))
+                (should (= (window-point selected) (point)))
+                (should (looking-at-p "RST"))
+                (should (= (window-start selected) (position "FIRST")))
+                (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+                (should (= (window-start other) (position "UNCHANGED-OFFSET")))
+                (should-not (string-match-p "OLD-HIDDEN\\|NEW-HIDDEN" (buffer-string)))
+                (should (eq root (cdr (assoc "pending-root" pilish--pending-tool-updates))))
+                (should (eq timer pilish--tool-update-flush-timer))
+                ;; The same queued paint still delivers the latest snapshot.
+                (cancel-timer timer)
+                (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+                  (pilish--flush-tool-updates buffer)))
+              (should (string-match-p (regexp-quote latest-preview) (buffer-string)))
+              (unless (equal latest-preview "FIRST")
+                (should-not (string-match-p "FIRST" (buffer-string))))
+              (should-not (string-match-p "OLD-HIDDEN\\|NEW-HIDDEN" (buffer-string)))
+              (should-not pilish--pending-tool-updates)
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+              (should (= (window-start other) (position "UNCHANGED-OFFSET")))
+              (pilish-test--nested-tab "pending-root" 'output)
+              (should (string-match-p "NEW-HIDDEN" (buffer-string)))
+              (should-not (string-match-p "OLD-HIDDEN" (buffer-string)))
+              ;; The next fold uses the newly painted snapshot, not the old one.
+              (goto-char (+ (position latest-preview) 2))
+              (set-window-start selected (position latest-preview) t)
+              (button-activate
+               (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))
+              (should (= (point) (+ (position latest-preview) 2)))
+              (should (= (window-point selected) (point)))
+              (should (= (window-start selected) (position latest-preview)))
+              (should-not (string-match-p "NEW-HIDDEN" (buffer-string)))
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET")))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest pilish-test-nested-output-collapse-before-pending-update-retains-displayed-snapshot ()
+  "A queued parent's shifted rows cannot invalidate a public collapse."
+  ;; Latest-result row 3 does not index the two currently displayed rows.
+  (pilish-test--nested-output-collapse-before-update "\n\nFIRST\nNEW-HIDDEN" "FIRST"))
+
+(ert-deftest pilish-test-nested-output-collapse-before-same-size-update-keeps-source-identity ()
+  "Equal row counts cannot make a fold map FIRST onto unrelated OTHER."
+  ;; A bounds check alone would silently associate these different source rows.
+  (pilish-test--nested-output-collapse-before-update "OTHER\nNEW-HIDDEN" "OTHER"))
+
+(ert-deftest pilish-test-nested-mid-buffer-rewrite-preserves-view ()
+  "Late expansion keeps two windows' text, section offsets and tail following."
+  ;; Restoring unmapped positions or body-wide offsets moves readers after
+  ;; the block and readers in an unchanged sibling to different text.
+  (let ((buffer (generate-new-buffer " *pi-nested-view*"))
+        (pilish-quit-without-confirmation t))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (pilish-chat-mode)
+          (let ((inhibit-read-only t))
+            (insert "BEFORE-START\nBEFORE-POINT\n"))
+          (pilish-test--nested-event
+           "tool_execution_start" "view-root" nil :toolName "runner" :args '(:job "view"))
+          (pilish-test--nested-event
+           "tool_execution_start" "before-child" "view-root" :toolName "read" :args '(:path "before.el"))
+          (pilish-test--nested-event
+           "tool_execution_start" "stable-child" "view-root" :toolName "read" :args '(:path "stable.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" "stable-child" "view-root" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "UNCHANGED-SECTION\nUNCHANGED-OFFSET")]))
+          (pilish-test--nested-event
+           "tool_execution_end" "view-root" nil :toolName "runner" :isError nil
+           :result '(:content [(:type "text" :text "PARENT-VIEW")]))
+          (pilish-test--nested-tab "view-root" '(child . "stable-child"))
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (dotimes (index 10) (insert (format "filler %02d\n" index)))
+            (insert "VIEW-A-START context\nVIEW-A-POINT sentinel\n")
+            (dotimes (index 10) (insert (format "between %02d\n" index)))
+            (insert "VIEW-B-START context\nVIEW-B-POINT sentinel\n")
+            (dotimes (index 60) (insert (format "tail filler %02d\n" index))))
+          (let ((selected (selected-window)) (other (split-window-right)))
+            (set-window-buffer other buffer)
+            (cl-labels ((position (text)
+                          (save-excursion (goto-char (point-min)) (search-forward text) (match-beginning 0)))
+                        (button (section)
+                          (let ((ov (pilish--tool-block-overlay (pilish--nested-tool-owner "view-root"))))
+                            (pilish--find-toggle-button-in-region (overlay-start ov) (overlay-end ov) section))))
+              ;; Both views before the root stay fixed through late insertion.
+              (goto-char (position "BEFORE-POINT"))
+              (set-window-start selected (position "BEFORE-START") t)
+              (set-window-point other (position "BEFORE-POINT"))
+              (set-window-start other (position "BEFORE-START") t)
+              (pilish-test--nested-event
+               "tool_execution_end" "before-child" "view-root" :toolName "read" :isError nil
+               :result (list :content (vector (list :type "text" :text
+                                                    (mapconcat (lambda (i) (format "LATE-%02d" i))
+                                                               (number-sequence 0 24) "\n")))))
+              (should (pilish-test--window-point-text-p selected "BEFORE-POINT"))
+              (should (pilish-test--window-point-text-p other "BEFORE-POINT"))
+              (should (equal "BEFORE-START" (pilish-test--window-start-line selected)))
+              (should (equal "BEFORE-START" (pilish-test--window-start-line other)))
+              ;; Both views after it keep their literal strings on expansion.
+              (goto-char (position "VIEW-A-POINT"))
+              (set-window-start selected (position "VIEW-A-START") t)
+              (set-window-point other (position "VIEW-B-POINT"))
+              (set-window-start other (position "VIEW-B-START") t)
+              (button-activate (button '(child . "before-child")))
+              (should (looking-at-p "VIEW-A-POINT sentinel"))
+              (should (pilish-test--window-point-text-p selected "VIEW-A-POINT sentinel"))
+              (should (pilish-test--window-point-text-p other "VIEW-B-POINT sentinel"))
+              (should (equal "VIEW-A-START context" (pilish-test--window-start-line selected)))
+              (should (equal "VIEW-B-START context" (pilish-test--window-start-line other)))
+              ;; A sibling's offset survives; the collapsed section clamps to
+              ;; its own summary, not to the parent's first output fence.
+              (goto-char (position "UNCHANGED-OFFSET"))
+              (set-window-start selected (position "UNCHANGED-SECTION") t)
+              (set-window-point other (+ (position "LATE-24") 4))
+              (set-window-start other (position "LATE-20") t)
+              (button-activate (button '(child . "before-child")))
+              (should (looking-at-p "UNCHANGED-OFFSET"))
+              (should (equal "UNCHANGED-SECTION" (pilish-test--window-start-line selected)))
+              (should (pilish-test--window-point-text-p other "  ✓ read {\"path\":\"before.el\"}"))
+              (should (string-match-p "before.el" (pilish-test--window-start-line other)))
+              ;; No action should dislodge an actual following window.
+              (goto-char (point-max))
+              (recenter -1)
+              (should (pilish--window-following-p selected))
+              (button-activate (button '(child . "before-child")))
+              (should (= (point) (point-max)))
+              (should (= (window-point selected) (point-max))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(defun pilish-test--nested-demand-driven-image-output (read-svg-p)
+  "Repaint a closed rich child, opening its real output only on demand.
+READ-SVG-P selects returned SVG text rather than an image content block.
+The caller saves the window configuration; queued paints need a visible chat."
+  (with-temp-buffer
+    (switch-to-buffer (current-buffer))
+    (pilish-chat-mode)
+    (let* ((svg "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"1\"><rect width=\"2\" height=\"1\"/></svg>")
+           (name (if read-svg-p "read" "image_tool"))
+           (args (if read-svg-p '(:path "missing.svg") '(:label "image-only")))
+           (result (list :content
+                         (if read-svg-p (vector (list :type "text" :text svg))
+                           (vector (list :type "image" :mimeType "image/png"
+                                         :data pilish-test--png-base64)))))
+           (decode (symbol-function 'base64-decode-string))
+           (scan (symbol-function 'pilish--standalone-svg-p))
+           (decode-count 0)
+           (scan-count 0))
+      (cl-letf (((symbol-function 'base64-decode-string)
+                 (lambda (&rest args)
+                   (cl-incf decode-count)
+                   (apply decode args)))
+                ((symbol-function 'pilish--standalone-svg-p)
+                 (lambda (&rest args)
+                   (cl-incf scan-count)
+                   (apply scan args))))
+        (pilish-test--nested-event
+         "tool_execution_start" "lazy-root" nil :toolName "runner" :args '(:job "lazy"))
+        (pilish-test--nested-event
+         "tool_execution_start" "rich-child" "lazy-root" :toolName name :args args)
+        (pilish-test--nested-event
+         "tool_execution_end" "rich-child" "lazy-root" :toolName name :isError :false :result result)
+        (pilish-test--nested-event
+         "tool_execution_start" "progress-child" "lazy-root" :toolName "runner" :args '(:job "progress"))
+        (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "lazy-root")))
+               (closed (buffer-substring-no-properties (point-min) (point-max))))
+          (cl-labels ((button ()
+                        (pilish--find-toggle-button-in-region
+                         (overlay-start overlay) (overlay-end overlay) '(child . "rich-child")))
+                      (repaint ()
+                        (pilish-test--nested-event
+                         "tool_execution_update" "progress-child" "lazy-root"
+                         :partialResult '(:content []))
+                        (should (assoc "lazy-root" pilish--pending-tool-updates))
+                        (cancel-timer pilish--tool-update-flush-timer)
+                        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+                          (pilish--flush-tool-updates (current-buffer)))
+                        (should-not pilish--pending-tool-updates)))
+            (should (equal "[+ output]" (button-label (button))))
+            (should-not (pilish-test--image-preview-positions))
+            (dotimes (_ 2) (repaint))
+            (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))
+            (should (= 0 decode-count))
+            (should (= 0 scan-count))
+            ;; Opening runs the normal selector and real image preparation.
+            (pilish-test--nested-tab "lazy-root" '(child . "rich-child"))
+            (should (equal "[- output]" (button-label (button))))
+            (should (> (if read-svg-p scan-count decode-count) 0))
+            (let* ((positions (pilish-test--image-preview-positions))
+                   (position (car positions)))
+              (should (= 1 (length positions)))
+              (should (string-match-p
+                       (regexp-quote (if read-svg-p "Image: image/svg+xml" "Image: image/png"))
+                       (buffer-string)))
+              (if (and (display-images-p)
+                       (image-type-available-p (if read-svg-p 'svg 'png)))
+                  (should (eq 'image (car (get-text-property position 'display))))
+                (should-not (get-text-property position 'display))))
+            (when read-svg-p
+              (should (string-match-p (regexp-quote svg) (buffer-string))))
+            (let ((opened-decodes decode-count) (opened-scans scan-count))
+              (pilish-test--nested-tab "lazy-root" '(child . "rich-child"))
+              (dotimes (_ 2) (repaint))
+              (should (= opened-decodes decode-count))
+              (should (= opened-scans scan-count)))
+            (should (equal "[+ output]" (button-label (button))))
+            (should-not (pilish-test--image-preview-positions))
+            (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))))))))
+
+(ert-deftest pilish-test-nested-closed-image-only-output-prepares-on-demand ()
+  "Closed image-only children keep output buttons without decoding on repaint."
+  ;; Eager child selection decodes invisible images on every root redraw.
+  (save-window-excursion
+    (pilish-test--nested-demand-driven-image-output nil)))
+
+(ert-deftest pilish-test-nested-closed-read-svg-output-prepares-on-demand ()
+  "Closed read-SVG children skip scanning; public opening renders SVG and text."
+  ;; Omitting base64 work alone still eagerly scans returned SVG text.
+  (save-window-excursion
+    (pilish-test--nested-demand-driven-image-output t)))
+
+(ert-deftest pilish-test-nested-output-availability-follows-selected-text ()
+  "Closed output buttons match details, write, edit, ANSI-empty and empty bodies."
+  ;; A second availability grammar loses args/diffs/details or exposes dead
+  ;; output buttons for text that becomes empty after ANSI filtering.
+  (dolist (case '(("details-only" "inspect" nil
+                  (:content [] :details (:answer 7)) "\"answer\": 7")
+                 ("write-args" "write" (:path "written.el" :content "WRITTEN-FROM-ARGS")
+                  (:content []) "WRITTEN-FROM-ARGS")
+                 ("edit-diff" "edit" (:path "edited.el")
+                  (:content [(:type "text" :text "ACK")]
+                   :details (:diff "+ 1 EDIT-ADDED\n- 2 EDIT-REMOVED")) "EDIT-ADDED")
+                 ("ansi-empty" "bash" (:command "printf empty")
+                  (:content [(:type "text" :text "\33[31m\33[0m")]) nil)
+                 ("truly-empty" "inspect" nil (:content []) nil)))
+    (pcase-let ((`(,id ,name ,args ,result ,expected) case))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish-test--nested-event
+         "tool_execution_start" "availability-root" nil :toolName "runner" :args '(:job "availability"))
+        (pilish-test--nested-event
+         "tool_execution_start" id "availability-root" :toolName name :args args)
+        (pilish-test--nested-event
+         "tool_execution_end" id "availability-root" :toolName name :isError :false :result result)
+        (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "availability-root")))
+               (section (cons 'child id)))
+          (cl-labels ((button ()
+                        (pilish--find-toggle-button-in-region
+                         (overlay-start overlay) (overlay-end overlay) section)))
+            (should (eq (not (null expected)) (not (null (button)))))
+            (let ((closed (buffer-substring-no-properties (point-min) (point-max))))
+              (pilish-test--nested-tab "availability-root" section)
+              (if (null expected)
+                  (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))
+                (should (equal "[- output]" (button-label (button))))
+                ;; Search below the summary: write arguments also name the
+                ;; output, but the body must really be inserted on opening.
+                (goto-char (button-end (button)))
+                (forward-line 1)
+                (should (search-forward expected (overlay-end overlay) t))
+                (when (equal name "edit")
+                  (should (= 4 (length (seq-filter
+                                        (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                        (overlays-in (point-min) (point-max)))))))
+                (pilish-test--nested-tab "availability-root" section)
+                (should (equal "[+ output]" (button-label (button))))
+                (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))
+                (should-not (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                        (overlays-in (point-min) (point-max))))))))))))
+
+(ert-deftest pilish-test-nested-child-results-preserve-text-images-and-diffs ()
+  "Public folds retain rich results and never annotate a failed parent as success."
+  ;; Losing destination-buffer insertion loses diff overlays; whole-body
+  ;; insertion leaks closed images and can damage adjacent tool output.
+  (dolist (parent-name '("edit" "read"))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) nil)))
+        (pilish-test--nested-event
+         "tool_execution_start" "rich-root" nil :toolName parent-name
+         :args '(:path "parent.svg"))
+        (pilish-test--nested-event
+         "tool_execution_start" "image-child" "rich-root" :toolName "image_tool" :args '(:label "image"))
+        (pilish-test--nested-event
+         "tool_execution_end" "image-child" "rich-root" :toolName "image_tool" :isError nil
+         :result `(:content [(:type "text" :text "IMAGE-TEXT")
+                             (:type "image" :mimeType "image/png" :data ,pilish-test--png-base64)]))
+        (pilish-test--nested-event
+         "tool_execution_start" "edit-child" "rich-root" :toolName "edit" :args '(:path "child.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "edit-child" "rich-root" :toolName "edit" :isError nil
+         :result '(:content [(:type "text" :text "Edited child")]
+                   :details (:diff "+ 1 CHILD-ADDED\n- 2 CHILD-REMOVED")))
+        (pilish-test--nested-event
+         "tool_execution_start" "failed-child" "rich-root" :toolName "read" :args '(:path "missing.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "failed-child" "rich-root" :toolName "read" :isError t
+         :result '(:content [(:type "text" :text "No file\nretry\tdenied")]))
+        (pilish-test--nested-event
+         "tool_execution_end" "rich-root" nil :toolName parent-name :isError t
+         :result '(:content [(:type "text" :text "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>")]
+                   :details (:diff "+ 1 PARENT-FAILED-DIFF")))
+        (should (string-match-p (regexp-quote " — No file\\nretry\\tdenied")
+                                (cdr (assoc "failed-child" (pilish-test--nested-summary-lines "rich-root" t)))))
+        (should-not (pilish-test--image-preview-positions))
+        (should-not (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                (overlays-in (point-min) (point-max))))
+        ;; Adjacent diff overlays must survive every parent redraw.
+        (pilish-test--nested-event
+         "tool_execution_start" "adjacent" nil :toolName "edit" :args '(:path "adjacent.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "adjacent" nil :toolName "edit" :isError nil
+         :result '(:content [(:type "text" :text "Edited adjacent")]
+                   :details (:diff "+ 1 ADJACENT-INTACT")))
+        (dotimes (_ 2)
+          (pilish-test--nested-tab "rich-root" '(child . "image-child"))
+          (should (= 1 (length (pilish-test--image-preview-positions))))
+          (should (= 1 (how-many "IMAGE-TEXT" (point-min) (point-max))))
+          (pilish-test--nested-tab "rich-root" '(child . "edit-child"))
+          (should (string-match-p "CHILD-ADDED" (buffer-string)))
+          (let ((diffs (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                  (overlays-in (point-min) (point-max)))))
+            (should (= 6 (length diffs)))
+            (dolist (overlay diffs)
+              (let ((section (get-text-property (overlay-start overlay) 'pilish-tool-section)))
+                (when section (should (equal section '(child . "edit-child")))))))
+          (pilish-test--nested-event
+           "tool_execution_update" "ongoing" "rich-root" :toolName "read"
+           :args '(:path "ongoing.el") :partialResult '(:content []))
+          (should (assoc "rich-root" pilish--pending-tool-updates))
+          (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish--flush-tool-updates (current-buffer)))
+          (should (= 1 (length (pilish-test--image-preview-positions))))
+          (should (= 1 (how-many "IMAGE-TEXT" (point-min) (point-max))))
+          (should (= 1 (how-many "ADJACENT-INTACT" (point-min) (point-max))))
+          (should (string-match-p (if (equal parent-name "edit") "PARENT-FAILED-DIFF" "<svg") (buffer-string)))
+          (pilish-test--nested-tab "rich-root" '(child . "edit-child"))
+          (should-not (string-match-p "CHILD-ADDED" (buffer-string)))
+          (should (= 2 (length (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                          (overlays-in (point-min) (point-max))))))
+          (pilish-test--nested-tab "rich-root" '(child . "image-child"))
+          (should-not (pilish-test--image-preview-positions))
+          (should-not (string-match-p "IMAGE-TEXT" (buffer-string))))
+        (should (= 2 (length (pilish-test--all-tool-overlays))))))))
+
+(ert-deftest pilish-test-nested-cold-form-retains-all-visible-sections ()
+  "Cooling freezes the displayed selection, not a newly computed preview."
+  ;; First-fence cooling loses children; a fresh render after width/budget
+  ;; changes freezes different text and may expose closed full payloads.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 2) (width 80))
+      (cl-letf (((symbol-function 'pilish--chat-display-width) (lambda () width))
+                ((symbol-function 'display-images-p) (lambda (&rest _) t))
+                ((symbol-function 'image-type-available-p) (lambda (_) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'frozen-image-spec)))
+        (pilish-test--nested-event
+         "tool_execution_start" "cold-root" nil :toolName "read" :args '(:path "parent.el"))
+        (pilish-test--nested-event
+         "tool_execution_update" "cold-root" nil
+         :partialResult '(:content [(:type "text" :text "initial parent preview")]))
+        (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+          (pilish--flush-tool-updates (current-buffer)))
+        (dolist (id '("open-child" "closed-child"))
+          (pilish-test--nested-event
+           "tool_execution_start" id "cold-root" :toolName "edit" :args '(:path "child.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" id "cold-root" :toolName "edit" :isError nil
+           :result (list :content (vector (list :type "image" :mimeType "image/png" :data pilish-test--png-base64))
+                         :details (list :diff (if (equal id "open-child")
+                                                 "+ 1 OPEN-VISIBLE\n- 2 OPEN-REMOVED\n```md\nINNER-CODE\n```"
+                                               "+ 1 CLOSED-SECRET")))))
+        (should (string-match-p "initial parent preview" (buffer-string)))
+        (pilish-test--nested-event
+         "tool_execution_end" "cold-root" nil :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "PARENT-A\nPARENT-B\nPARENT-HIDDEN")]))
+        (pilish-test--nested-tab "cold-root" '(child . "open-child"))
+        (let* ((root (pilish--nested-tool-owner "cold-root"))
+               (calls (pilish--tool-block-nested-calls root))
+               (overlay (pilish--tool-block-overlay root))
+               (header (pilish--tool-block-header-end root))
+               (end (pilish--tool-block-end-marker root))
+               (rows (pilish-test--nested-summary-lines "cold-root" t))
+               (body-start (marker-position header))
+               (displayed (buffer-substring-no-properties body-start (marker-position end))))
+          (should (pilish--tool-block-last-tail root))
+          (should (pilish--tool-block-displayed-output root))
+          (should (string-match-p "PARENT-B" displayed))
+          (should (string-match-p "OPEN-VISIBLE" displayed))
+          (should-not (string-match-p (regexp-opt '("PARENT-HIDDEN" "CLOSED-SECRET")) displayed))
+          (should (= 1 (length (pilish-test--image-preview-positions))))
+          (setq width 1 pilish-tool-preview-lines 0)
+          (should (pilish--cool-tool-overlay overlay))
+          ;; Language tags are the only text removed: the exact displayed
+          ;; preview, inert fold labels and open child selection are frozen.
+          (should (equal (replace-regexp-in-string
+                          "~~~emacs-lisp" "~~~"
+                          (replace-regexp-in-string "```emacs-lisp" "```" displayed))
+                         (buffer-substring-no-properties
+                          body-start (next-single-property-change
+                                      body-start 'pilish-cold-tool-block nil (point-max)))))
+          (should (string-match-p "```md\nINNER-CODE\n```" (buffer-string)))
+          (should (equal rows (pilish-test--nested-summary-lines "cold-root" t)))
+          (let ((images (pilish-test--image-preview-positions)))
+            (should (= 1 (length images)))
+            (should (eq 'frozen-image-spec (get-text-property (car images) 'display))))
+          (should-not (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                  (overlays-in (point-min) (point-max))))
+          (should-not (pilish--find-toggle-button-in-region (point-min) (point-max)))
+          (should-not (text-property-not-all (point-min) (point-max) 'button nil))
+          (should-not (text-property-not-all (point-min) (point-max) 'pilish-full-content nil))
+          (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+          (should-not (overlay-buffer overlay))
+          (should-not (marker-buffer header))
+          (should-not (marker-buffer end))
+          (should-not (pilish--tool-block-folds root))
+          (should-not (pilish--tool-block-last-tail root))
+          (should-not (pilish--tool-block-nested-calls root))
+          (should-not (pilish--tool-block-args root))
+          (should-not (pilish--tool-block-result root))
+          (should-not (pilish--tool-block-displayed-output root))
+          (dolist (call calls)
+            (should-not (pilish--nested-call-arguments call))
+            (should-not (pilish--nested-call-result call))))))))
+
+(ert-deftest pilish-test-nested-child-sections-do-not-inherit-parent-file-target ()
+  "Only the parent's header/output retain its path and read-line mapping."
+  ;; Falling through to parent authority in a child can open the wrong file;
+  ;; falling through to visible child text invents unrequested child navigation.
+  (dolist (budget '(2 20))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((pilish-tool-preview-lines budget) (default-directory "/tmp/"))
+        (pilish-test--nested-event
+         "tool_execution_start" "file-root" nil :toolName "read" :args '(:path "parent.el" :offset 10))
+        (pilish-test--nested-event
+         "tool_execution_start" "file-child" "file-root" :toolName "read" :args '(:path "child.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "file-child" "file-root" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "Open other/path.el:99")]))
+        (pilish-test--nested-event
+         "tool_execution_end" "file-root" nil :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "PARENT-FIRST\n\nPARENT-THIRD\nPARENT-HIDDEN")]))
+        (pilish-test--nested-tab "file-root" '(child . "file-child"))
+        (let* ((root (pilish--nested-tool-owner "file-root"))
+               (overlay (pilish--tool-block-overlay root))
+               (header-start (overlay-start overlay)))
+          (when (= budget 20)
+            (should (string-match-p "PARENT-FIRST\n\nPARENT-THIRD" (buffer-string))))
+          (dotimes (state 2)
+            (goto-char header-start)
+            (should (equal "/tmp/parent.el" (plist-get (pilish--file-target-at-point) :emacs-path)))
+            (goto-char header-start)
+            (search-forward "PARENT-THIRD")
+            (let ((target (pilish--file-target-at-point)))
+              (should (equal "/tmp/parent.el" (plist-get target :emacs-path)))
+              (should (= 12 (plist-get target :line))))
+            (dolist (text '("Child calls" "child.el" "other/path.el:99"))
+              (goto-char header-start)
+              (search-forward text)
+              (backward-char 1)
+              (should-not (pilish--file-target-at-point)))
+            (when (= state 0) (should (pilish--cool-tool-overlay overlay)))))))))
+
+(ert-deftest pilish-test-nested-routes-grandchildren-and-concurrent-roots ()
+  "Explicit immediate parents route opaque IDs into exactly two root blocks."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((now 10))
+      (cl-letf (((symbol-function 'current-time)
+                 (lambda () (seconds-to-time now))))
+        (pilish-test--nested-event
+         "tool_execution_start" "root-A" nil :toolName "runner"
+         :args '(:script "authoritative A"))
+        (pilish-test--nested-event
+         "tool_execution_start" "root-B" nil :toolName "runner"
+         :args '(:script "authoritative B"))
+        (let ((a (pilish--tool-block-get "root-A"))
+              (b (pilish--tool-block-get "root-B")))
+          (pilish-test--nested-event
+           "tool_execution_start" "opaque-child" "root-A"
+           :toolName "runner" :args '(:job "A child"))
+          (setq now 12)
+          (pilish-test--nested-event
+           "tool_execution_start" "opaque-grandchild" "opaque-child"
+           :toolName "read" :args '(:path "a.el"))
+          (pilish-test--nested-event
+           "tool_execution_start" "different-id" "root-B"
+           :toolName "bash" :args '(:command "B child"))
+          ;; A broken ordinary dispatch creates five overlays, before any
+          ;; assertions depend on the new ownership API.
+          (should (= 2 (length (pilish-test--all-tool-overlays))))
+          (should (= 2 (hash-table-count pilish--live-tool-blocks)))
+          (dolist (id '("opaque-child" "opaque-grandchild" "different-id"))
+            (should-not (pilish--tool-block-get id)))
+          (should (eq a (pilish--nested-tool-owner "opaque-grandchild")))
+          (should (eq b (pilish--nested-tool-owner "different-id")))
+          (should (equal (mapcar #'car (pilish-test--nested-summary-lines "root-A"))
+                         '("opaque-child" "opaque-grandchild")))
+          (should (equal (mapcar #'car (pilish-test--nested-summary-lines "root-B"))
+                         '("different-id")))
+          (should (gethash "opaque-grandchild"
+                           (plist-get pilish--state :active-tools)))
+          ;; Missing assistant preview membership is not execution evidence.
+          (pilish--handle-display-event
+           '(:type "message_end" :message (:role "assistant" :content [])))
+          (should (= 2 (length (pilish-test--all-tool-overlays))))
+          (should (eq a (pilish--tool-block-get "root-A")))
+          (should (eq b (pilish--tool-block-get "root-B")))
+          (let ((child (pilish--nested-call-get a "opaque-child"))
+                (grandchild (pilish--nested-call-get a "opaque-grandchild")))
+            (should (equal (mapcar #'pilish--nested-call-id
+                                  (pilish--tool-block-nested-calls a))
+                           '("opaque-child" "opaque-grandchild")))
+            (should (equal (mapcar #'pilish--nested-call-id
+                                  (pilish--tool-block-nested-calls b))
+                           '("different-id")))
+            (should (equal (pilish--nested-call-arguments grandchild)
+                           '(:path "a.el")))
+            (should (equal (pilish--tool-block-args a)
+                           '(:script "authoritative A")))
+            (should (equal (pilish--tool-block-args b)
+                           '(:script "authoritative B")))
+            (setq now 14)
+            (pilish-test--nested-event
+             "tool_execution_end" "opaque-child" "root-A"
+             :toolName "runner" :isError nil
+             :result '(:content [(:type "text" :text "child done")]))
+            (should (pilish--nested-pending-p a))
+            (should (= 4000 (pilish--nested-call-duration-ms child)))
+            ;; Repeated events must neither duplicate nor reopen/reset a call.
+            (dolist (type '("tool_execution_start" "tool_execution_update"))
+              (pilish-test--nested-event
+               type "opaque-child" "root-A" :toolName "runner"
+               :args '(:job "do not reset") :partialResult '(:content []))
+              (pilish-test--nested-event
+               type "opaque-grandchild" "opaque-child" :toolName "read"
+               :args '(:path "a.el") :partialResult '(:content [])))
+            (should (eq child (pilish--nested-call-get a "opaque-child")))
+            (should (eq 'ok (pilish--nested-call-status child)))
+            (should-not (pilish--nested-call-pending-end-p child))
+            (should (equal (pilish--nested-call-arguments child)
+                           '(:job "A child")))
+            (setq now 16)
+            (pilish-test--nested-event
+             "tool_execution_end" "opaque-grandchild" "opaque-child"
+             :toolName "read" :isError nil
+             :result '(:content [(:type "text" :text "grandchild done")]))
+            (should (= 4000 (pilish--nested-call-duration-ms grandchild)))
+            (should (equal (pilish--nested-call-result grandchild)
+                           '(:content [(:type "text" :text "grandchild done")])))
+            (should-not (pilish--nested-pending-p a))
+            (should (pilish--nested-pending-p b))
+            (should-not (gethash "opaque-grandchild"
+                                 (plist-get pilish--state :active-tools)))
+            (pilish-test--nested-event
+             "tool_execution_end" "root-A" nil :toolName "runner" :isError t
+             :result '(:content [(:type "text" :text "parent done")]
+                       :details (:parent-only t)))
+            (should-not (pilish--tool-block-get "root-A"))
+            (should (eq a (pilish--nested-tool-owner "root-A")))
+            (should (eq a (pilish--nested-tool-owner "opaque-child")))
+            (should (equal (pilish--tool-block-result a)
+                           '(:content [(:type "text" :text "parent done")]
+                             :details (:parent-only t) :isError t)))
+            (should (= 2 (length (pilish--tool-block-nested-calls a))))
+            (pilish-test--nested-tab "root-A" '(child . "opaque-grandchild"))
+            (should (= 1 (how-many "grandchild done" (point-min) (point-max))))
+            (should (equal (mapcar #'car (pilish-test--nested-summary-lines "root-A"))
+                           '("opaque-child" "opaque-grandchild")))
+            (goto-char (point-min))
+            (search-forward "grandchild done")
+            (should (eq (pilish--tool-block-overlay a) (pilish--tool-overlay-at-point)))
+            (should (= 2 (length (pilish-test--all-tool-overlays))))))))))
+
 ;;; Response Display
 
 (ert-deftest pilish-test-append-to-chat-inserts-text ()
@@ -1157,6 +3669,63 @@ as the top-level structure."
     (pilish--append-to-chat "Some response")
     (pilish--display-agent-end)
     (should (string-suffix-p "response\n" (buffer-string)))))
+
+(ert-deftest pilish-test-agent-end-unexecuted-toolcall-has-single-newline ()
+  "A streamed tool call that never executes ends with one header terminator."
+  ;; The trim boundary retains the header newline; appending another newline
+  ;; would add an empty line to the exact visible stream projection.
+  (pilish-test--with-streaming-assistant
+    (let ((call '(:type "toolCall" :id "unexecuted" :name "bash"
+                  :arguments (:command "echo final"))))
+      (pilish-test--send-assistant-message-update
+       '(:type "toolcall_start" :contentIndex 0 :id "unexecuted" :toolName "bash"))
+      (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"echo")
+      (pilish-test--send-raw-toolcall-delta 0 " final\"}")
+      (pilish-test--send-assistant-message-update
+       (list :type "toolcall_end" :contentIndex 0 :toolCall call))
+      (pilish--handle-display-event
+       (list :type "message_end" :message (list :role "assistant" :content (vector call))))
+      (let* ((block (pilish--tool-block-get "unexecuted"))
+             (overlay (pilish--tool-block-overlay block)))
+        (should-not (pilish--tool-block-execution-start block))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (should (equal (buffer-substring-no-properties (overlay-start overlay) (point-max))
+                       "$ echo final\n"))
+        (should (= (marker-position (pilish--tool-block-header-end block)) (point-max)))))))
+
+(ert-deftest pilish-test-agent-end-aborted-empty-tool-preserves-late-child-boundary ()
+  "Abort adds one blank line after an empty retained tool without damaging it."
+  ;; A child update can owe an end before its owner paint.  The empty header's
+  ;; newline must count toward abort spacing and remain a late-redraw boundary.
+  (pilish-test--with-streaming-assistant
+    (unwind-protect
+        (progn
+          (pilish-test--nested-event
+           "tool_execution_start" "p" nil :toolName "runner" :args nil)
+          (pilish-test--nested-event
+           "tool_execution_update" "child" "p" :toolName "read" :args '(:path "late.el")
+           :partialResult '(:content []))
+          (let* ((root (pilish--nested-tool-owner "p"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (header (pilish--tool-block-header-end root)))
+            (should (= (marker-position header)
+                       (marker-position (pilish--tool-block-end-marker root))))
+            (setq pilish--aborted t)
+            (pilish--handle-display-event '(:type "agent_end" :messages []))
+            (should (equal (buffer-substring-no-properties (overlay-start overlay) (point-max))
+                           "runner\n\n[Aborted]\n"))
+            (should (pilish--nested-pending-p root))
+            (should (eq (char-before header) ?\n))
+            (pilish-test--nested-event
+             "tool_execution_end" "child" "p" :toolName "read" :isError nil
+             :result '(:content []))
+            (should (equal (buffer-substring-no-properties (overlay-start overlay) header)
+                           "runner\n"))
+            (should (string-prefix-p "Child calls\n" (buffer-substring-no-properties header (point-max))))
+            (should (equal (pilish-test--nested-summary-lines "p")
+                           '(("child" . "  ✓ read {\"path\":\"late.el\"}"))))
+            (should (string-suffix-p "\n\n[Aborted]\n" (buffer-string)))))
+      (pilish--cancel-tool-update-flush))))
 
 (ert-deftest pilish-test-spacing-blank-line-after-user-header ()
   "User header has a blank line after setext underline."
@@ -1633,6 +4202,98 @@ and no disturbance to a following assistant turn."
       (should (string-match-p "Assistant" text))
       (should (string-match-p "Plain string reply" text)))))
 
+(defun pilish-test--history-assistant-outcome (reason explanation annotation &optional partial-text)
+  "Replay saved REASON with EXPLANATION and require one literal ANNOTATION.
+When PARTIAL-TEXT is supplied it must precede the outcome, never be erased."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish--status 'streaming)
+          (pilish--aborted t)
+          (pilish--local-user-message "WAITING USER")
+          (pilish--followup-queue '("FOLLOWUP"))
+          (messages
+           (vector '(:role "user" :content [(:type "text" :text "USER INPUT")])
+                   (append (list :role "assistant" :stopReason reason
+                                 :content (if partial-text
+                                              (vector (list :type "text" :text partial-text))
+                                            []))
+                           (when explanation (list :errorMessage explanation))))))
+      (dotimes (_ 2)
+        (pilish--display-session-history messages (current-buffer))
+        (font-lock-ensure)
+        (should (string-match-p (regexp-quote annotation)
+                                (pilish--visible-text (point-min) (point-max))))
+        (should (= 1 (pilish-test--count-matches "\\[\\(?:Error\\|Aborted\\)" (buffer-string))))
+        (should (= 1 (pilish-test--count-matches "USER INPUT" (buffer-string))))
+        (when partial-text
+          (should (= 1 (pilish-test--count-matches (regexp-quote partial-text) (buffer-string))))
+          (should (< (pilish-test--hover-pos partial-text) (pilish-test--hover-pos annotation))))
+        ;; Replaying a saved outcome is not a live message_end or agent_end.
+        (should (eq pilish--status 'streaming))
+        (should pilish--aborted)
+        (should (equal pilish--local-user-message "WAITING USER"))
+        (should (equal pilish--followup-queue '("FOLLOWUP")))))))
+
+(ert-deftest pilish-test-history-saved-assistant-empty-error ()
+  "The real empty Stop shape stays an error, not an inferred cancellation."
+  (pilish-test--history-assistant-outcome
+   "error" "This operation was aborted" "[Error: This operation was aborted]"))
+
+(ert-deftest pilish-test-history-saved-assistant-empty-aborted ()
+  "An empty saved aborted message retains its supplied explanation."
+  (pilish-test--history-assistant-outcome
+   "aborted" "Request was aborted" "[Aborted: Request was aborted]"))
+
+(ert-deftest pilish-test-history-saved-assistant-partial-error ()
+  "Failed partial content stays visible with its literal saved explanation."
+  ;; Markdown in the error is server text, not emphasis or a clickable link.
+  (pilish-test--history-assistant-outcome
+   "error" "Connection failed: **retry** [help](there) `later`"
+   "[Error: Connection failed: **retry** [help](there) `later`]" "PARTIAL ANSWER"))
+
+(ert-deftest pilish-test-history-saved-assistant-partial-aborted ()
+  "A partial aborted answer must not look complete after reload."
+  (pilish-test--history-assistant-outcome
+   "aborted" "Stopped by user" "[Aborted: Stopped by user]" "PARTIAL ANSWER"))
+
+(ert-deftest pilish-test-history-saved-assistant-error-without-explanation ()
+  "An unexplained saved error still has a small visible failure annotation."
+  (pilish-test--history-assistant-outcome "error" nil "[Error]"))
+
+(ert-deftest pilish-test-history-saved-assistant-aborted-without-explanation ()
+  "An unexplained saved abort still has a small visible interruption annotation."
+  (pilish-test--history-assistant-outcome "aborted" nil "[Aborted]"))
+
+(ert-deftest pilish-test-history-saved-assistant-without-terminal-facts ()
+  "Old empty and nonempty messages do not acquire fabricated terminal outcomes."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish--display-session-history
+     [(:role "assistant" :content [])
+      (:role "assistant" :content [(:type "text" :text "OLD REPLY")])]
+     (current-buffer))
+    (should (= 1 (pilish-test--count-matches "OLD REPLY" (buffer-string))))
+    (should-not (string-match-p "\\[\\(?:Error\\|Aborted\\)" (buffer-string)))))
+
+(ert-deftest pilish-test-history-saved-assistant-consecutive-outcomes ()
+  "Grouped assistant messages retain exactly one outcome each in message order."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (dotimes (_ 2)
+      (pilish--display-session-history
+       [(:role "assistant" :content [(:type "text" :text "FIRST PARTIAL")]
+         :stopReason "error" :errorMessage "Connection failed")
+        (:role "assistant" :content [] :stopReason "aborted" :errorMessage "Stopped")
+        (:role "assistant" :content [(:type "text" :text "NEXT ANSWER")])]
+       (current-buffer))
+      (should (= 1 (pilish-test--count-matches "Assistant\n===" (buffer-string))))
+      (should (= 1 (pilish-test--count-matches (regexp-quote "[Error: Connection failed]") (buffer-string))))
+      (should (= 1 (pilish-test--count-matches (regexp-quote "[Aborted: Stopped]") (buffer-string))))
+      (should (< (pilish-test--hover-pos "FIRST PARTIAL")
+                 (pilish-test--hover-pos "[Error: Connection failed]")
+                 (pilish-test--hover-pos "[Aborted: Stopped]")
+                 (pilish-test--hover-pos "NEXT ANSWER"))))))
+
 (ert-deftest pilish-test-history-renders-branch-summary-between-assistant-groups ()
   "Branch summaries keep source order and split adjacent assistant groups."
   (with-temp-buffer
@@ -2023,6 +4684,96 @@ The banner is toggled before thinking blocks and outline cycling."
              (items (treesit-query-capture root '((list_item) @item))))
         (should (= 12 (length headings)))
         (should (= 10 (length items)))))))
+
+(ert-deftest pilish-test-startup-banner-pathless-commands-have-no-file-action ()
+  "RET cannot invent a source for pathless commands, even after refontification."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (pilish-chat-mode)
+      (pilish--set-chat-session-identity "/tmp/project/")
+      (setq pilish--commands
+            (mapcar
+             (lambda (command)
+               (pilish--normalize-command command "/tmp/project/"))
+             (list
+              (list :name "mcp" :source "extension"
+                    :sourceInfo (list :scope "temporary" :path "builtin:mcp"))
+              (list :name "llama" :source "extension"
+                    :sourceInfo (list :scope "temporary"
+                                      :path "builtin:llama.cpp")))))
+      (dolist (command pilish--commands)
+        (should-not (plist-member command :path)))
+      (let ((pilish-visit-file-other-window t)
+            opened refusals)
+        (cl-letf (((symbol-function 'pilish--startup-context-files) #'ignore)
+                  ((symbol-function 'find-file-other-window)
+                   (lambda (path &rest _) (push path opened)))
+                  ((symbol-function 'find-file)
+                   (lambda (path &rest _) (push path opened))))
+          (pilish--display-startup-header)
+          (goto-char (point-min))
+          (search-forward "TAB details")
+          (execute-kbd-macro (kbd "TAB"))
+          (dolist (refontify '(nil t))
+            (when refontify
+              (font-lock-flush)
+              (font-lock-ensure))
+            (dolist (name '("/mcp" "/llama"))
+              (goto-char (point-min))
+              (search-forward name)
+              (backward-char)
+              ;; Collect both phases even on RED; no real root file is opened.
+              (push (condition-case err
+                        (progn (execute-kbd-macro (kbd "RET")) nil)
+                      (user-error (error-message-string err)))
+                    refusals))))
+        (should-not opened)
+        (should (equal (nreverse refusals)
+                       '("No file at point" "No file at point"
+                         "No file at point" "No file at point")))))))
+
+(ert-deftest pilish-test-startup-banner-source-ownership-preserves-file-actions ()
+  "Known sources and ordinary chat paths still open before and after refontifying."
+  (let ((path (make-temp-file "pilish-test-banner source-" nil ".ts" "source\n"))
+        opened)
+    (unwind-protect
+        (save-window-excursion
+          (with-temp-buffer
+            (switch-to-buffer (current-buffer))
+            (pilish-chat-mode)
+            (pilish--set-chat-session-identity "/tmp/project/")
+            (setq pilish--commands
+                  (list (pilish--normalize-command
+                         (list :name "z-local" :source "extension"
+                               :sourceInfo (list :scope "project" :path path))
+                         "/tmp/project/")))
+            (let ((pilish-visit-file-other-window t))
+              (cl-letf (((symbol-function 'pilish--startup-context-files) #'ignore)
+                        ((symbol-function 'find-file-other-window)
+                         (lambda (file &rest _) (push file opened)))
+                        ((symbol-function 'find-file)
+                         (lambda (file &rest _) (push file opened))))
+                (pilish--display-session-history
+                 [(:role "user" :content [(:type "text" :text "Ordinary path: /mcp")]
+                   :timestamp 1704067200000)]
+                 (current-buffer))
+                (goto-char (point-min))
+                (search-forward "TAB details")
+                (execute-kbd-macro (kbd "TAB"))
+                (dolist (refontify '(nil t))
+                  (when refontify
+                    (font-lock-flush)
+                    (font-lock-ensure))
+                  (dolist (name '("/z-local" "/mcp"))
+                    (goto-char (point-min))
+                    (search-forward name)
+                    (backward-char)
+                    (when (equal name "/mcp")
+                      (should-not (get-text-property (point) 'pilish-startup-banner)))
+                    (execute-kbd-macro (kbd "RET")))))))
+          (should (equal (nreverse opened) (list path "/mcp" path "/mcp"))))
+      (delete-file path))))
 
 (ert-deftest pilish-test-startup-banner-source-links-visit-real-files ()
   "RET on each kind of source opens its file, including unusual path names."
@@ -3530,6 +6281,31 @@ since we don't display them locally. Let pi's message_start handle it."
         (should message-shown)
         (should (string-match-p "Extension loaded successfully" message-shown))))))
 
+(ert-deftest pilish-test-mcp-notifies-use-existing-echo-area ()
+  "MCP info, warnings, and errors use the echo area without RPC responses."
+  (pilish-test-with-rpc-session (chat _input _proc commands)
+    (let (responses)
+      (cl-letf (((symbol-function 'pilish--send-extension-ui-response)
+                 (lambda (proc response) (push (list proc response) responses))))
+        (with-current-buffer chat
+          (let ((before (buffer-string)))
+            (dolist (case '(("info"
+                            "MCP servers are still connecting; their tools become available once connected."
+                            "Pi: MCP servers are still connecting; their tools become available once connected.")
+                           ("warning" "MCP configuration error" "Pi: ⚠ MCP configuration error")
+                           ("error" "MCP connection failed" "Pi: ✗ MCP connection failed")))
+              (let (notices)
+                (cl-letf (((symbol-function 'message)
+                           (lambda (fmt &rest args)
+                             (push (apply #'format fmt args) notices))))
+                  (pilish--handle-display-event
+                   (list :type "extension_ui_request" :id "mcp-notify"
+                         :method "notify" :message (nth 1 case) :notifyType (car case))))
+                (should (equal notices (list (nth 2 case))))))
+            (should (equal (buffer-string) before))))
+        (should-not responses)
+        (should-not commands)))))
+
 (ert-deftest pilish-test-extension-ui-confirm-yes ()
   "extension_ui_request confirm method uses yes-or-no-p and sends response."
   (let ((response-sent nil))
@@ -3668,6 +6444,62 @@ since we don't display them locally. Let pi's message_start handle it."
         (should (equal (plist-get response-sent :type) "extension_ui_response"))
         (should (equal (plist-get response-sent :id) "req-5"))
         (should (equal (plist-get response-sent :value) "user input"))))))
+
+(ert-deftest pilish-test-extension-ui-input-placeholder-is-not-initial-text ()
+  "Ordinary paste submits only pasted text, keeping any hint in the prompt."
+  (dolist (case '(("John Doe" "Enter name: (John Doe) ")
+                  (nil "Enter name: ")
+                  ("" "Enter name: ")))
+    (pcase-let ((`(,placeholder ,expected-prompt) case))
+      (let (read-args sent messages)
+        (cl-letf (((symbol-function 'read-string)
+                   (lambda (&rest args)
+                     (setq read-args args)
+                     (concat (nth 1 args) "PASTED_TEXT")))
+                  ((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (proc response)
+                     (push (list proc response) sent)))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (when fmt (push (apply #'format fmt args) messages)))))
+          (pilish--extension-ui-input
+           (list :type "extension_ui_request" :id "req-paste" :method "input"
+                 :title "Enter name:" :placeholder placeholder)
+           'test-proc))
+        (should (equal (plist-get (cadar sent) :value) "PASTED_TEXT"))
+        (should (equal sent
+                       '((test-proc (:type "extension_ui_response"
+                                     :id "req-paste" :value "PASTED_TEXT")))))
+        (should (equal (car read-args) expected-prompt))
+        (should-not (nth 1 read-args))
+        (should-not (nth 3 read-args))
+        (should-not messages)))))
+
+(ert-deftest pilish-test-extension-ui-input-empty-does-not-submit-placeholder ()
+  "Untouched input submits an empty string, never its hint or a default."
+  (let (read-args sent messages)
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest args)
+                 (setq read-args args)
+                 (or (nth 1 args) (nth 3 args) "")))
+              ((symbol-function 'pilish--send-extension-ui-response)
+               (lambda (proc response)
+                 (push (list proc response) sent)))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (when fmt (push (apply #'format fmt args) messages)))))
+      (pilish--extension-ui-input
+       '(:type "extension_ui_request" :id "req-empty" :method "input"
+         :title "Enter name:" :placeholder "John Doe")
+       'test-proc))
+    (should (equal (plist-get (cadar sent) :value) ""))
+    (should (equal sent
+                   '((test-proc (:type "extension_ui_response"
+                                 :id "req-empty" :value "")))))
+    (should (equal (car read-args) "Enter name: (John Doe) "))
+    (should-not (nth 1 read-args))
+    (should-not (nth 3 read-args))
+    (should-not messages)))
 
 (ert-deftest pilish-test-extension-ui-set-editor-text ()
   "extension_ui_request set_editor_text inserts text into input buffer."
@@ -3941,6 +6773,221 @@ See https://github.com/dnouri/pilish/issues/176."
              :prefill "some text")))
         (should response-sent)
         (should (eq (plist-get response-sent :cancelled) t))))))
+
+;; W1 Task 1 fixture: a valid supported-dialog request. File-local to these tests.
+(defun pilish-test--extension-dialog-request (method &optional id)
+  "Return a supported METHOD request with ID, defaulting to METHOD."
+  (list :type "extension_ui_request" :id (or id method) :method method
+        :title "Question:" :message "Continue?"
+        :options ["Option A" "Option B"] :placeholder "Default"))
+
+(ert-deftest pilish-test-extension-ui-w1-completion-exits ()
+  "Every pre-response exit cancels; only error and quit are contained."
+  (dolist (proc '(t nil))
+    (dolist (exit '(error quit throw))
+      (let (sent)
+        (cl-letf (((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (process response)
+                     (push (list process response) sent))))
+          (let ((outcome
+                 (catch 'w1-dialog-unwind
+                   (condition-case nil
+                       (progn
+                         (pilish--complete-extension-ui-dialog
+                          (pilish-test--extension-dialog-request "input" "input-cancel") proc
+                          (lambda ()
+                            (if (eq exit 'throw)
+                                (throw 'w1-dialog-unwind :thrown)
+                              (signal exit nil))))
+                         :returned)
+                     ((error quit) :escaped)))))
+            (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
+            (should (equal sent
+                           (when proc
+                             '((t (:type "extension_ui_response"
+                                   :id "input-cancel" :cancelled t))))))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-completion-send-failures ()
+  "Neither a failed success send nor a failed cancel send gets retried."
+  (dolist (kind '(success cancel))
+    (dolist (exit '(error quit throw))
+      (let* ((expected (if (eq kind 'success)
+                           '(:type "extension_ui_response" :id "input" :value "")
+                         '(:type "extension_ui_response" :id "input" :cancelled t)))
+             sent)
+        (cl-letf (((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (_process response)
+                     ;; Record the attempt BEFORE failing, like a partial write.
+                     (push response sent)
+                     (if (eq exit 'throw)
+                         (throw 'w1-send-unwind :thrown)
+                       (signal exit nil)))))
+          (let ((outcome
+                 (catch 'w1-send-unwind
+                   (condition-case nil
+                       (progn
+                         (pilish--complete-extension-ui-dialog
+                          (pilish-test--extension-dialog-request "input") t
+                          (lambda ()
+                            (if (eq kind 'cancel) (error "Reader failed") expected)))
+                         :returned)
+                     ((error quit) :escaped)))))
+            (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
+            (should (equal sent (list expected)))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-exits ()
+  "All three supported methods cancel on any nonlocal reader exit."
+  (dolist (method '("confirm" "select" "input"))
+    (dolist (proc '(t nil))
+      (dolist (exit '(error quit throw))
+        (with-temp-buffer
+          (pilish-chat-mode)
+          (let* ((pilish--process proc) (reads 0) sent
+                 (reader (lambda (&rest _)
+                           (cl-incf reads)
+                           (if (eq exit 'throw)
+                               (throw 'w1-dialog-unwind :thrown)
+                             (signal exit nil)))))
+            (cl-letf (((symbol-function 'yes-or-no-p) reader)
+                      ((symbol-function 'completing-read) reader)
+                      ((symbol-function 'read-string) reader)
+                      ((symbol-function 'pilish--send-extension-ui-response)
+                       (lambda (process response) (push (list process response) sent))))
+              (let ((outcome
+                     (catch 'w1-dialog-unwind
+                       (condition-case nil
+                           (progn
+                             (pilish--handle-extension-ui-request
+                              (pilish-test--extension-dialog-request method))
+                             :returned)
+                         ((error quit) :escaped)))))
+                (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
+                (should (= reads 1))
+                (should (equal sent
+                               (when proc
+                                 (list (list proc (list :type "extension_ui_response"
+                                                       :id method :cancelled t))))))))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-success ()
+  "Declining confirmation and empty values are successes, not cancellations."
+  (dolist (case '(("confirm" t :confirmed t)
+                  ("confirm" nil :confirmed :json-false)
+                  ("select" "Option A" :value "Option A")
+                  ("select" "" :value "")
+                  ("input" "text" :value "text")
+                  ("input" "" :value "")))
+    (pcase-let ((`(,method ,answer ,key ,expected) case))
+      (dolist (proc '(t nil))
+        (with-temp-buffer
+          (pilish-chat-mode)
+          (let* ((pilish--process proc) (reads 0) sent
+                 (reader (lambda (&rest _) (cl-incf reads) answer)))
+            (cl-letf (((symbol-function 'yes-or-no-p) reader)
+                      ((symbol-function 'completing-read) reader)
+                      ((symbol-function 'read-string) reader)
+                      ((symbol-function 'pilish--send-extension-ui-response)
+                       (lambda (_process response) (push response sent))))
+              (pilish--handle-extension-ui-request
+               (pilish-test--extension-dialog-request method)))
+            (should (= reads 1))
+            (should (equal sent
+                           (when proc
+                             (list (list :type "extension_ui_response"
+                                         :id method key expected)))))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-preparation ()
+  "Prompt preparation and minibuffer setup are inside the completion guard."
+  (dolist (method '("confirm" "select"))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((pilish--process t) (minibuffer-setup-hook nil)
+            (event (pilish-test--extension-dialog-request method)) read-called sent)
+        ;; A valid id with a malformed title fails before the confirm reader.
+        (when (equal method "confirm") (setq event (plist-put event :title 42)))
+        (cl-letf (((symbol-function 'yes-or-no-p)
+                   (lambda (&rest _) (setq read-called t) t))
+                  ((symbol-function 'pilish--extension-ui-select-minibuffer-setup)
+                   (lambda () (signal 'quit nil)))
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _)
+                     (setq read-called t)
+                     (run-hooks 'minibuffer-setup-hook)
+                     "Option A"))
+                  ((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (_process response) (push response sent))))
+          (should (eq :returned
+                      (condition-case nil
+                          (progn (pilish--handle-extension-ui-request event) :returned)
+                        ((error quit) :escaped)))))
+        (should (eq read-called (equal method "select")))
+        (should (equal sent (list (list :type "extension_ui_response"
+                                       :id method :cancelled t))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-reentrant ()
+  "An inner dialog's success cannot suppress the outer dialog's cancellation."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish--process 'outer-proc) sent)
+      (cl-letf (((symbol-function 'yes-or-no-p)
+                 (lambda (&rest _)
+                   (let ((pilish--process 'inner-proc))
+                     (pilish--handle-extension-ui-request
+                      (pilish-test--extension-dialog-request "input" "inner")))
+                   (signal 'quit nil)))
+                ((symbol-function 'read-string) (lambda (&rest _) ""))
+                ((symbol-function 'pilish--send-extension-ui-response)
+                 (lambda (process response) (push (list process response) sent))))
+        (should (eq :returned
+                    (condition-case nil
+                        (progn
+                          (pilish--handle-extension-ui-request
+                           (pilish-test--extension-dialog-request "confirm" "outer"))
+                          :returned)
+                      ((error quit) :escaped)))))
+      (should (equal (reverse sent)
+                     '((inner-proc (:type "extension_ui_response" :id "inner" :value ""))
+                       (outer-proc (:type "extension_ui_response" :id "outer" :cancelled t))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-filter-batch ()
+  "One filter call survives reader and cancellation-send error/quit."
+  (dolist (case '((quit nil) (error nil) (quit error) (quit quit)))
+    (pcase-let ((`(,reader-exit ,send-exit) case))
+      (pilish-test-with-rpc-session (chat _input proc commands)
+        (let* ((sender (symbol-function 'pilish--send-string)) tail-response
+               (reader (lambda (&rest _) (signal reader-exit nil))))
+          (puthash "tail" (lambda (response) (setq tail-response response))
+                   (pilish--get-pending-requests proc))
+          (cl-letf (((symbol-function 'yes-or-no-p) reader)
+                    ((symbol-function 'completing-read) reader)
+                    ((symbol-function 'read-string) reader)
+                    ((symbol-function 'message) #'ignore)
+                    ((symbol-function 'pilish--send-string)
+                     (lambda (process line)
+                       (funcall sender process line)
+                       (when send-exit (signal send-exit nil)))))
+            (should (eq :returned
+                        (condition-case nil
+                            (progn
+                              (apply #'pilish-test--stdout proc
+                                     (append
+                                      (mapcar #'pilish-test--extension-dialog-request
+                                              '("confirm" "select" "input"))
+                                      '((:type "extension_ui_request" :method "setStatus"
+                                         :statusKey "w1" :statusText "ready")
+                                        (:type "response" :id "tail"
+                                         :command "get_state" :success t))))
+                              :returned)
+                          ((error quit) :escaped)))))
+          ;; Compare all parsed outbound messages, not just the last send.
+          (should (equal (reverse commands)
+                         (mapcar (lambda (id)
+                                   (list :type "extension_ui_response" :id id :cancelled t))
+                                 '("confirm" "select" "input"))))
+          (should (eq (plist-get tail-response :success) t))
+          (should (= 0 (hash-table-count (pilish--get-pending-requests proc))))
+          (should (equal (buffer-local-value 'pilish--extension-status chat)
+                         '(("w1" . "ready"))))
+          (should (process-live-p proc)))))))
 
 ;;; Pretty-Print JSON Helper
 
@@ -4925,6 +7972,913 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
     (save-excursion
       (goto-char (window-point window))
       (looking-at-p (regexp-quote text)))))
+
+;;; Nested execution lifetime at the cooling and teardown seams
+
+(defun pilish-test--nested-text-turn (text)
+  "Deliver a settled no-tool turn with user TEXT through display events."
+  (pilish--handle-display-event '(:type "agent_start"))
+  (pilish--handle-display-event
+   `(:type "message_start" :message
+     (:role "user" :content [(:type "text" :text ,text)])))
+  (pilish--handle-display-event
+   '(:type "message_start" :message (:role "assistant" :content [])))
+  (pilish-test--send-assistant-message-update
+   `(:type "text_delta" :contentIndex 0 :delta ,(concat "Reply to " text)))
+  (pilish--handle-display-event
+   `(:type "message_end" :message
+     (:role "assistant" :content [(:type "text" :text ,(concat "Reply to " text))])))
+  (pilish--handle-display-event '(:type "agent_end" :messages []))
+  (pilish--handle-display-event '(:type "agent_settled")))
+
+(ert-deftest pilish-test-nested-unselected-chat-keeps-independent-roots ()
+  "Rendering with input selected must not insert at the history reader's point."
+  ;; Width measurement must not move the insertion cursor to window-point.
+  ;; Unlike selected-chat fixtures, this models the ordinary two-buffer UI.
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (let ((chat (current-buffer)) (chat-window (selected-window)))
+        (switch-to-buffer chat)
+        (pilish-chat-mode)
+        (pilish-test--nested-event
+         "tool_execution_start" "first" nil :toolName "codemode"
+         :args (list :code (mapconcat (lambda (i) (format "text(%d);" i))
+                                     (number-sequence 1 12) "\n")))
+        (dotimes (i 12)
+          (let ((id (format "first-%d" i)))
+            (pilish-test--nested-event
+             "tool_execution_start" id "first" :toolName "read"
+             :args (list :path (format "file-%d.el" i)))
+            (pilish-test--nested-event
+             "tool_execution_end" id "first" :toolName "read" :isError nil
+             :result '(:content [(:type "text" :text "ORIGINAL-CHILD-OUTPUT")]))))
+        (pilish-test--nested-event
+         "tool_execution_start" "first-late" "first" :toolName "wait" :args '(:tag "first"))
+        (pilish-test--nested-event
+         "tool_execution_end" "first" nil :toolName "codemode" :isError nil
+         :result (list :content (vector (list :type "text" :text
+                                              (mapconcat (lambda (i) (format "PARENT-%d" i))
+                                                         (number-sequence 1 12) "\n")))))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (pilish-test--nested-tab "first" 'children)
+        (pilish-test--nested-tab "first" '(child . "first-0"))
+        (pilish-test--nested-tab "first" 'output)
+        (let* ((first (pilish--nested-tool-owner "first"))
+               (first-overlay (pilish--tool-block-overlay first))
+               (original (buffer-substring-no-properties
+                          (overlay-start first-overlay) (overlay-end first-overlay)))
+               (rows (pilish-test--nested-summary-lines "first" t))
+               (input-window (split-window-below)))
+          (goto-char (pilish-test--hover-pos "Child calls"))
+          (set-window-start chat-window (point) t)
+          (with-temp-buffer
+            (let ((input (current-buffer)))
+              (insert "UNSENT-INPUT")
+              (set-window-buffer input-window input)
+              (select-window input-window)
+              (with-current-buffer chat
+                (pilish-test--nested-event
+                 "tool_execution_start" "second" nil :toolName "runner" :args '(:tag "second"))
+                (pilish-test--nested-event
+                 "tool_execution_start" "bridge" "second" :toolName "bridge" :args '(:tag "second"))
+                (pilish-test--nested-event
+                 "tool_execution_start" "grandchild" "bridge" :toolName "wait" :args '(:tag "second"))
+                (pilish-test--nested-event
+                 "tool_execution_end" "bridge" "second" :toolName "bridge" :isError nil :result '(:content []))
+                (pilish-test--nested-event
+                 "tool_execution_end" "second" nil :toolName "runner" :isError nil
+                 :result '(:content [(:type "text" :text "SECOND-PARENT-OUTPUT")]))
+                ;; Pi persists the parent's snapshot after execution end;
+                ;; that second repaint exposed the originally inverted bounds.
+                (pilish--handle-display-event
+                 '(:type "message_end" :message
+                   (:role "toolResult" :toolCallId "second" :toolName "runner"
+                    :content [(:type "text" :text "SECOND-PARENT-OUTPUT")]
+                    :isError nil :nestedCalls
+                    (:complete :false
+                     :calls [(:id "bridge" :name "bridge" :status "ok" :arguments (:tag "second"))
+                             (:id "grandchild" :name "wait" :status "unfinished" :arguments (:tag "second"))]))))
+                (pilish--handle-display-event '(:type "agent_end" :messages []))
+                (pilish--handle-display-event '(:type "agent_settled"))
+                (should (equal rows (pilish-test--nested-summary-lines "first" t)))
+                (should (equal original (buffer-substring-no-properties
+                                         (overlay-start first-overlay) (overlay-end first-overlay))))
+                (should (equal (mapcar #'car (pilish-test--nested-summary-lines "second"))
+                               '("bridge" "grandchild")))
+                (should (= 2 (length (pilish-test--all-tool-overlays))))
+                (let* ((second (pilish--nested-tool-owner "second"))
+                       (second-overlay (pilish--tool-block-overlay second)))
+                  (should (< (overlay-end first-overlay) (overlay-start second-overlay)))
+                  (dolist (root (list first second))
+                    (let ((overlay (pilish--tool-block-overlay root)))
+                      (should (< (overlay-start overlay) (marker-position (pilish--tool-block-header-end root))))
+                      (should (< (marker-position (pilish--tool-block-header-end root)) (overlay-end overlay)))
+                      (should (= (marker-position (pilish--tool-block-end-marker root)) (overlay-end overlay))))))
+                ;; A queued child update on the older root preserves all open
+                ;; sections too, rather than being blocked by damaged bounds.
+                (pilish-test--nested-event
+                 "tool_execution_update" "first-late" "first" :toolName "wait" :partialResult '(:content []))
+                (when (timerp pilish--tool-update-flush-timer)
+                  (cancel-timer pilish--tool-update-flush-timer))
+                (pilish--flush-tool-updates chat)
+                (should (equal rows (pilish-test--nested-summary-lines "first" t)))
+                (should (equal original (buffer-substring-no-properties
+                                         (overlay-start first-overlay) (overlay-end first-overlay))))
+                (should (pilish-test--window-point-text-p chat-window "Child calls"))
+                (should (equal "Child calls" (pilish-test--window-start-line chat-window))))
+              (should (eq input-window (selected-window)))
+              (should (equal (buffer-string) "UNSENT-INPUT")))))))))
+
+(ert-deftest pilish-test-codemode-unselected-details-refresh-preserves-folds ()
+  "A details-only repaint with input selected preserves expanded sections."
+  ;; An insertion cursor changed by width measurement corrupts a live
+  ;; codemode body just as it corrupts finalized roots on late child ends.
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (let ((chat (current-buffer)) (chat-window (selected-window))
+            (pilish-tool-preview-lines 1))
+        (switch-to-buffer chat)
+        (pilish-chat-mode)
+        (pilish-test--nested-event
+         "tool_execution_start" "staged" nil :toolName "codemode"
+         :args '(:code "text(1);\ntext(2);\ntext(3);"))
+        (dolist (id '("one" "two"))
+          (pilish-test--nested-event
+           "tool_execution_end" id "staged" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "OPEN-CHILD-OUTPUT")])))
+        (pilish-test--nested-event
+         "tool_execution_update" "staged" nil
+         :partialResult '(:content [(:type "text" :text "PARENT-1\nPARENT-2\nPARENT-3")]))
+        (pilish-test--flush-tool-updates)
+        (dolist (section '(script output children (child . "one")))
+          (pilish-test--nested-tab "staged" section))
+        (pilish--append-to-chat "\nAFTER-STAGED\n")
+        (goto-char (pilish-test--hover-pos "text(2);"))
+        (set-window-start chat-window (pilish-test--hover-pos "text(1);") t)
+        (let ((input-window (split-window-below)))
+          (with-temp-buffer
+            (set-window-buffer input-window (current-buffer))
+            (select-window input-window)
+            (with-current-buffer chat
+              (pilish-test--nested-event
+               "tool_execution_update" "staged" nil
+               :partialResult '(:content [] :details
+                                 (:calls [(:id "model" :name "models.classify" :status "running")])))
+              (pilish-test--flush-tool-updates)
+              (should (= 1 (how-many "text(1);" (point-min) (point-max))))
+              (should (= 1 (how-many "text(3);" (point-min) (point-max))))
+              (should (= 1 (how-many "PARENT-3" (point-min) (point-max))))
+              (should (= 1 (how-many "OPEN-CHILD-OUTPUT" (point-min) (point-max))))
+              (should (equal (pilish-test--nested-summary-lines "staged" t)
+                             '(("one" . "  ✓ read") ("two" . "  ✓ read")
+                               ("model" . "  … models.classify"))))
+              (should (looking-at-p "text(2);"))
+              (should (pilish-test--window-point-text-p chat-window "text(2);"))
+              (should (equal "text(1);" (pilish-test--window-start-line chat-window)))
+              ;; Public section targeting remains usable after the repaint.
+              (pilish-test--nested-tab "staged" 'script)
+              (should-not (string-match-p "text(3);" (buffer-string)))
+              (should (string-match-p "PARENT-3" (buffer-string)))
+              (should (string-match-p "OPEN-CHILD-OUTPUT" (buffer-string)))
+              (should (= 3 (length (pilish-test--nested-summary-lines "staged")))))))))))
+
+(ert-deftest pilish-test-nested-unselected-chat-late-end-stays-before-newer-turns ()
+  "A late grandchild end and natural cooling preserve newer turns and readers."
+  ;; A width query while another buffer is selected used to redirect body
+  ;; insertion into NEWER-D, and the resulting bad bounds moved point to tail.
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (let ((chat (current-buffer)) (chat-window (selected-window))
+            (pilish-hot-tail-turn-count 1))
+        (switch-to-buffer chat)
+        (pilish-chat-mode)
+        (pilish--handle-display-event '(:type "agent_start"))
+        (pilish-test--nested-event
+         "tool_execution_start" "clean" nil :toolName "runner" :args '(:tag "clean"))
+        (pilish-test--nested-event
+         "tool_execution_start" "bridge" "clean" :toolName "bridge" :args '(:tag "clean"))
+        (pilish-test--nested-event
+         "tool_execution_start" "late" "bridge" :toolName "wait" :args '(:tag "clean"))
+        (pilish-test--nested-event
+         "tool_execution_end" "bridge" "clean" :toolName "bridge" :isError nil :result '(:content []))
+        (pilish-test--nested-event
+         "tool_execution_end" "clean" nil :toolName "runner" :isError nil
+         :result '(:content [(:type "text" :text "ORIGINAL-PARENT")]))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (pilish-test--nested-text-turn "NEWER-C")
+        (pilish-test--nested-text-turn "NEWER-D")
+        (let* ((root (pilish--nested-tool-owner "clean"))
+               (overlay (pilish--tool-block-overlay root))
+               (original-start (overlay-start overlay))
+               (newer-start (copy-marker (overlay-end overlay) t))
+               (newer-text (buffer-substring-no-properties newer-start (point-max)))
+               (input-window (split-window-below)))
+          (should (< (overlay-end overlay) (marker-position pilish--hot-tail-start)))
+          (should-not pilish--tool-cooling-queue)
+          (goto-char (pilish-test--hover-pos "NEWER-D"))
+          (set-window-start chat-window (pilish-test--hover-pos "NEWER-C") t)
+          (with-temp-buffer
+            (set-window-buffer input-window (current-buffer))
+            (select-window input-window)
+            (with-current-buffer chat
+              (pilish-test--nested-event
+               "tool_execution_end" "late" "bridge" :toolName "wait" :isError nil
+               :result '(:content [(:type "text" :text "LATE-OUTPUT")]))
+              (should (equal newer-text (buffer-substring-no-properties newer-start (point-max))))
+              (should (= original-start (overlay-start overlay)))
+              (should (< (marker-position (pilish--tool-block-header-end root)) (overlay-end overlay)))
+              (should (= (overlay-end overlay) (marker-position newer-start)))
+              (should (looking-at-p "NEWER-D"))
+              (should (pilish-test--window-point-text-p chat-window "NEWER-D"))
+              (should (equal "NEWER-C" (pilish-test--window-start-line chat-window)))
+              (should (equal (pilish-test--nested-summary-lines "clean" t)
+                             '(("bridge" . "  ✓ bridge {\"tag\":\"clean\"}")
+                               ("late" . "  ✓ wait {\"tag\":\"clean\"}"))))
+              (should (memq overlay pilish--tool-cooling-queue))
+              (should (pilish-test--drain-tool-cooling-via-real-timers))
+              (should-not (overlay-buffer overlay))
+              (should-not pilish--tool-cooling-timer)
+              (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+              (should (equal newer-text (buffer-substring-no-properties newer-start (point-max))))
+              (should (looking-at-p "NEWER-D"))
+              (should (pilish-test--window-point-text-p chat-window "NEWER-D"))
+              (should (equal "NEWER-C" (pilish-test--window-start-line chat-window)))
+              (should (equal (mapcar #'car (pilish-test--nested-summary-lines "clean")) '("bridge" "late")))
+              (should (eq 'idle pilish--status))
+              (should (equal "idle" pilish--activity-phase)))))))))
+
+(ert-deftest pilish-test-codemode-late-end-cooling-preserves-two-readers ()
+  "Natural cooling maps both readers through all earlier fence-tag deletions."
+  ;; Whole-body offsets fail after the JavaScript and expanded child fences;
+  ;; keeping point after redraw alone does not test the queued cold projection.
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (let ((chat (current-buffer)) (pilish-hot-tail-turn-count 1))
+        (switch-to-buffer chat)
+        (pilish-chat-mode)
+        (pilish--handle-display-event '(:type "agent_start"))
+        (pilish-test--nested-event
+         "tool_execution_start" "cool" nil :toolName "codemode" :args '(:code "text(\"```\");"))
+        (dolist (child '(("earlier" "earlier.py" "EARLIER-OUTPUT")
+                         ("stable" "CHILD-VIEW.el" "OUTPUT-START\nOUTPUT-POINT")))
+          (pilish-test--nested-event
+           "tool_execution_start" (nth 0 child) "cool" :toolName "read" :args (list :path (nth 1 child)))
+          (pilish-test--nested-event
+           "tool_execution_end" (nth 0 child) "cool" :toolName "read" :isError nil
+           :result (list :content (vector (list :type "text" :text (nth 2 child))))))
+        (pilish-test--nested-event
+         "tool_execution_start" "late" "cool" :toolName "wait" :args '(:tag "cool"))
+        (pilish-test--nested-event
+         "tool_execution_end" "cool" nil :toolName "codemode" :isError nil
+         :result '(:content [(:type "text" :text "PARENT-OUTPUT")]))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (pilish-test--nested-tab "cool" '(child . "earlier"))
+        (pilish-test--nested-tab "cool" '(child . "stable"))
+        (pilish-test--nested-text-turn "NEWER-C")
+        (pilish-test--nested-text-turn "NEWER-D")
+        (let* ((root (pilish--nested-tool-owner "cool"))
+               (overlay (pilish--tool-block-overlay root))
+               (selected (selected-window))
+               (other (split-window-right))
+               (newer-start (copy-marker (overlay-end overlay) t))
+               (newer-text (buffer-substring-no-properties newer-start (point-max))))
+          (set-window-buffer other chat)
+          (goto-char (pilish-test--hover-pos "CHILD-VIEW.el"))
+          (set-window-start selected (line-beginning-position) t)
+          (set-window-point other (pilish-test--hover-pos "OUTPUT-POINT"))
+          (set-window-start other (pilish-test--hover-pos "OUTPUT-START") t)
+          (should (< (overlay-end overlay) (marker-position pilish--hot-tail-start)))
+          (should-not pilish--tool-cooling-queue)
+          (should-not (pilish--window-following-p selected))
+          (should-not (pilish--window-following-p other))
+          (pilish-test--nested-event
+           "tool_execution_end" "late" "cool" :toolName "wait" :isError nil
+           :result '(:content [(:type "text" :text "LATE-OUTPUT")]))
+          (should (pilish-test--window-point-text-p selected "CHILD-VIEW.el"))
+          (should (pilish-test--window-point-text-p other "OUTPUT-POINT"))
+          (should (memq overlay pilish--tool-cooling-queue))
+          (let ((summary-line (pilish-test--window-start-line selected)))
+            (should (pilish-test--drain-tool-cooling-via-real-timers))
+            (should-not (overlay-buffer overlay))
+            (should (looking-at-p "CHILD-VIEW.el"))
+            (should (pilish-test--window-point-text-p selected "CHILD-VIEW.el"))
+            (should (pilish-test--window-point-text-p other "OUTPUT-POINT"))
+            (should (equal summary-line (pilish-test--window-start-line selected)))
+            (should (equal "OUTPUT-START" (pilish-test--window-start-line other))))
+          (should (equal newer-text (buffer-substring-no-properties newer-start (point-max))))
+          (should (equal (mapcar #'car (pilish-test--nested-summary-lines "cool")) '("earlier" "stable" "late")))
+          (should-not (string-match-p "javascript\\|python\\|emacs-lisp" (buffer-string)))
+          (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+          (should-not pilish--tool-cooling-timer))))))
+
+(ert-deftest pilish-test-codemode-cooling-maps-deletion-boundaries ()
+  "Cold projection keeps outside readers and clamps readers in deleted tags."
+  (dolist (location '(before tag after tail))
+    (save-window-excursion
+      (with-temp-buffer
+        (switch-to-buffer (current-buffer))
+        (pilish-chat-mode)
+        (pilish--append-to-chat "BEFORE\n")
+        (pilish-test--nested-event
+         "tool_execution_start" "bounds" nil :toolName "codemode" :args '(:code "text(1);"))
+        (pilish-test--nested-event
+         "tool_execution_end" "bounds" nil :toolName "codemode" :isError nil :result '(:content []))
+        (pilish--append-to-chat "\nAFTER\nTAIL\n")
+        (goto-char (pcase location
+                     ('before (pilish-test--hover-pos "BEFORE"))
+                     ('tag (+ 4 (pilish-test--hover-pos "javascript")))
+                     ('after (pilish-test--hover-pos "AFTER"))
+                     ('tail (point-max))))
+        (should (pilish--cool-tool-overlay-preserving-view
+                 (pilish--tool-block-overlay (pilish--nested-tool-owner "bounds"))))
+        (pcase location
+          ('before (should (looking-at-p "BEFORE")))
+          ('tag (should (looking-at-p "\ntext(1);")))
+          ('after (should (looking-at-p "AFTER")))
+          ('tail (should (= (point) (point-max)))))
+        (should (= (point) (window-point (selected-window))))))))
+
+(ert-deftest pilish-test-nested-late-end-survives-newer-tail-and-cooling ()
+  "An observed child pins its original root through reconciliation and new turns."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-hot-tail-turn-count 1)
+          (now 10))
+      (pilish-test--with-recorded-cooling-timers jobs
+        (cl-letf (((symbol-function 'current-time)
+                   (lambda () (seconds-to-time now))))
+          (pilish--handle-display-event '(:type "agent_start"))
+          (pilish--handle-display-event
+           '(:type "message_start" :message (:role "assistant" :content [])))
+          (pilish-test--send-assistant-message-update
+           '(:type "toolcall_start" :contentIndex 0 :id "stale-preview"
+             :toolName "bash"))
+          (pilish-test--nested-event
+           "tool_execution_start" "retained-root" nil :toolName "runner"
+           :args '(:script "authoritative script"))
+          (pilish-test--nested-event
+           "tool_execution_start" "late-child" "retained-root"
+           :toolName "read" :args '(:path "original.el"))
+          (let* ((root (pilish--tool-block-get "retained-root"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (header (pilish--tool-block-header-end root))
+                 (end (pilish--tool-block-end-marker root))
+                 (child (pilish--nested-call-get root "late-child")))
+            (setq now 11)
+            (pilish-test--nested-event
+             "tool_execution_end" "retained-root" nil :toolName "runner"
+             :isError t :result '(:content [(:type "text" :text "root finished")]
+                                 :details (:parent-only "retained")))
+            (pilish--handle-display-event
+             '(:type "message_end" :message
+               (:role "assistant"
+                :content [(:type "toolCall" :id "retained-root" :name "runner"
+                           :arguments (:script "not execution args"))])))
+            ;; Reconciliation must prune only the pure preview, not recreate
+            ;; the finalized execution root or clear its ordinary result body.
+            (should (= 1 (length (pilish-test--all-tool-overlays))))
+            (should (eq overlay (car (pilish-test--all-tool-overlays))))
+            (should (string-match-p "root finished" (buffer-string)))
+            (should-not (pilish--tool-block-get "stale-preview"))
+            (should-not (pilish--tool-block-get "retained-root"))
+            (pilish--handle-display-event '(:type "agent_end" :messages []))
+            (pilish--handle-display-event '(:type "agent_settled"))
+            (should (= 0 (hash-table-count pilish--tool-args-cache)))
+            (should (eq root (pilish--nested-tool-owner "retained-root")))
+            (should (pilish--nested-call-pending-end-p child))
+            ;; Two new headed turns push the original root outside a tail of 1.
+            (dolist (text '("First newer reply" "Current newer reply"))
+              (setq pilish--assistant-header-shown nil)
+              (pilish--handle-display-event '(:type "agent_start"))
+              (pilish--handle-display-event
+               '(:type "message_start" :message (:role "assistant" :content [])))
+              (pilish-test--send-assistant-message-update
+               `(:type "text_delta" :contentIndex 0 :delta ,text))
+              (pilish--flush-stream-deltas)
+              (when (equal text "First newer reply")
+                (pilish--handle-display-event '(:type "agent_end" :messages []))
+                (pilish--handle-display-event '(:type "agent_settled"))))
+            (pilish-test--nested-event
+             "tool_execution_start" "newer-tool" nil :toolName "bash"
+             :args '(:command "newer work"))
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (insert "\nNEWER-TAIL\n"))
+            (setq pilish--followup-queue '("queued newer prompt")
+                  pilish--local-user-message "newer input owner")
+            (pilish--update-hot-tail-boundary)
+            (pilish--queue-tool-cooling-outside-hot-tail)
+            (should (< (overlay-start overlay)
+                       (marker-position pilish--hot-tail-start)))
+            (should-not (pilish--cool-tool-overlay overlay))
+            (should-not jobs)
+            (should-not pilish--tool-cooling-queue)
+            (should (overlay-buffer overlay))
+            (should (marker-buffer header))
+            (should (marker-buffer end))
+            (should (equal (pilish--tool-block-args root)
+                           '(:script "authoritative script")))
+            (should (equal (pilish--tool-block-result root)
+                           '(:content [(:type "text" :text "root finished")]
+                             :details (:parent-only "retained") :isError t)))
+            (let ((phase pilish--activity-phase)
+                  (newer (pilish--tool-block-get "newer-tool")))
+              (setq now 20)
+              (pilish-test--nested-event
+               "tool_execution_end" "late-child" "retained-root"
+               :toolName "read" :isError nil
+               :result '(:content [(:type "text" :text "late result")]))
+              (should (equal (pilish-test--nested-summary-lines "retained-root")
+                             '(("late-child" . "  ✓ read {\"path\":\"original.el\"} 10.0s"))))
+              (goto-char (point-min))
+              (search-forward "  ✓ read")
+              (should (< (point) (save-excursion (search-forward "NEWER-TAIL") (match-beginning 0))))
+              (should (equal phase pilish--activity-phase))
+              (should (eq 'streaming pilish--status))
+              (should (eq newer (pilish--tool-block-get "newer-tool")))
+              (should (equal pilish--followup-queue '("queued newer prompt")))
+              (should (equal pilish--local-user-message "newer input owner"))
+              (should (eq 'ok (pilish--nested-call-status child)))
+              (should (= 10000 (pilish--nested-call-duration-ms child)))
+              (should (equal (pilish--nested-call-result child)
+                             '(:content [(:type "text" :text "late result")])))
+              (should (= 2 (length (pilish-test--all-tool-overlays))))
+              (should (equal pilish--tool-cooling-queue (list overlay)))
+              (should (= 1 (length jobs)))
+              ;; No extra agent_end is needed to release the last obligation.
+              (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+                (pilish-test--invoke-recorded-cooling-timer (pop jobs)))
+              (should (equal (pilish-test--nested-summary-lines "retained-root")
+                             '(("late-child" . "  ✓ read {\"path\":\"original.el\"} 10.0s"))))
+              (goto-char (point-min))
+              (search-forward "  ✓ read")
+              (should (< (point) (save-excursion (search-forward "NEWER-TAIL") (match-beginning 0))))
+              (should-not (overlay-buffer overlay))
+              (should-not (marker-buffer header))
+              (should-not (marker-buffer end))
+              (should-not pilish--tool-cooling-queue)
+              (should-not pilish--tool-cooling-timer)
+              (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+              (should-not (pilish--tool-block-nested-calls root))
+              (should-not (pilish--tool-block-args root))
+              (should-not (pilish--tool-block-result root))
+              (should-not (pilish--nested-call-arguments child))
+              (should-not (pilish--nested-call-result child)))))))))
+
+(ert-deftest pilish-test-nested-cooling-rechecks-pending-descendants ()
+  "A queued retained root is rechecked when a new descendant owes an end."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-hot-tail-turn-count 0))
+      (pilish-test--with-recorded-cooling-timers jobs
+        (pilish--handle-display-event '(:type "agent_start"))
+        (pilish-test--nested-event
+         "tool_execution_start" "queued-root" nil :toolName "write"
+         :args '(:path "owned.el" :content "authoritative body"))
+        (pilish-test--nested-event
+         "tool_execution_start" "ended-child" "queued-root"
+         :toolName "runner" :args '(:job "initial"))
+        (pilish-test--nested-event
+         "tool_execution_end" "ended-child" "queued-root" :toolName "runner"
+         :isError nil :result '(:content []))
+        (let* ((root (pilish--tool-block-get "queued-root"))
+               (overlay (pilish--tool-block-overlay root)))
+          ;; Finalization can unregister ordinary execution before its result;
+          ;; the retained owner still identifies the exact original block.
+          (pilish--handle-display-event '(:type "agent_end" :messages []))
+          (pilish--handle-display-event '(:type "agent_settled"))
+          (pilish-test--nested-event
+           "tool_execution_end" "queued-root" nil :toolName "write"
+           :isError nil :result '(:content [(:type "text" :text "write done")]))
+          (should (= 1 (length (pilish-test--all-tool-overlays))))
+          (should (eq overlay (car (pilish-test--all-tool-overlays))))
+          (should (string-match-p "authoritative body" (buffer-string)))
+          (should (equal (pilish--tool-block-result root)
+                         '(:content [(:type "text" :text "write done")]
+                           :details nil :isError nil)))
+          (pilish--queue-tool-cooling-outside-hot-tail)
+          (should (equal pilish--tool-cooling-queue (list overlay)))
+          (should (= 1 (length jobs)))
+          (pilish-test--nested-event
+           "tool_execution_start" "intermediate" "ended-child"
+           :toolName "runner" :args '(:job "late descendant"))
+          (pilish-test--nested-event
+           "tool_execution_start" "grandchild" "intermediate"
+           :toolName "read" :args '(:path "leaf.el"))
+          ;; The same predicate guards collection and the actual rewrite.
+          (should-not (pilish--completed-tool-overlays-outside-hot-tail))
+          (should-not (pilish--cool-tool-overlay overlay))
+          (should (overlay-buffer overlay))
+          (pilish-test--nested-event
+           "tool_execution_end" "intermediate" "ended-child"
+           :toolName "runner" :isError nil :result '(:content []))
+          (should (pilish--nested-pending-p root))
+          (should-not (pilish--completed-tool-overlay-p overlay))
+          (should (eq root (pilish--nested-tool-owner "intermediate")))
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish-test--invoke-recorded-cooling-timer (pop jobs)))
+          (should (overlay-buffer overlay))
+          (should-not pilish--tool-cooling-queue)
+          (should-not jobs)
+          (pilish-test--nested-event
+           "tool_execution_end" "grandchild" "intermediate"
+           :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "final leaf")]))
+          (should (pilish--completed-tool-overlay-p overlay))
+          (should (equal pilish--tool-cooling-queue (list overlay)))
+          (should (= 1 (length jobs)))
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish-test--invoke-recorded-cooling-timer (pop jobs)))
+          (should-not (overlay-buffer overlay))
+          (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+          (should-not (pilish--tool-block-result root))
+          (should-not (pilish--tool-block-nested-calls root)))))))
+
+(ert-deftest pilish-test-nested-unknown-owner-never-appends-or-steals ()
+  "Unknown owners stay invisible; observed updates/ends need no invented start."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((now 10))
+      (cl-letf (((symbol-function 'current-time)
+                 (lambda () (seconds-to-time now))))
+        (pilish-test--nested-event
+         "tool_execution_start" "ordinary" nil :toolName "bash"
+         :args '(:command "ordinary work"))
+        (let ((ordinary (pilish--tool-block-get "ordinary"))
+              (partial '(:content [(:type "text" :text "ordinary partial")])))
+          (pilish--display-tool-update partial ordinary)
+          (let ((text (buffer-string))
+                (phase pilish--activity-phase))
+            (pilish-test--nested-event
+             "tool_execution_update" "ordinary" nil :partialResult partial)
+            (dolist (type '("tool_execution_start" "tool_execution_update"
+                            "tool_execution_end"))
+              (pilish-test--nested-event
+               type "ordinary/looks-related" "unknown-parent"
+               :toolName "read" :args '(:path "unowned.el")
+               :partialResult '(:content [(:type "text" :text "must not steal")])
+               :result '(:content [(:type "text" :text "must not append")])
+               :isError t))
+            (should (equal text (buffer-string)))
+            (should (equal phase pilish--activity-phase))
+            (should-not (pilish--tool-block-nested-calls ordinary))
+            (should-not (pilish--nested-tool-owner "ordinary/looks-related"))
+            (when (timerp pilish--tool-update-flush-timer)
+              (cancel-timer pilish--tool-update-flush-timer))
+            (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+              (pilish--flush-tool-updates (current-buffer)))
+            (should (equal text (buffer-string)))
+            (should (eq ordinary (pilish--tool-block-get "ordinary")))
+            (should (= 1 (length (pilish-test--all-tool-overlays)))))
+          (pilish-test--nested-event
+           "tool_execution_update" "update-only" "ordinary"
+           :toolName "read" :args '(:path "updated.el")
+           :partialResult '(:content [(:type "text" :text "not final output")]))
+          (let ((call (pilish--nested-call-get ordinary "update-only")))
+            (should (eq ordinary (pilish--nested-tool-owner "update-only")))
+            (should (equal (pilish--nested-call-arguments call)
+                           '(:path "updated.el")))
+            (should (pilish--nested-call-pending-end-p call))
+            (should-not (pilish--nested-call-started-at call))
+            (should-not (pilish--nested-call-duration-ms call))
+            (should-not (pilish--nested-call-result call))
+            (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+            (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+              (pilish--flush-tool-updates (current-buffer)))
+            (should (equal (pilish-test--nested-summary-lines "ordinary")
+                           '(("update-only" . "  … read {\"path\":\"updated.el\"}"))))
+            (setq now 50)
+            (pilish-test--nested-event
+             "tool_execution_end" "update-only" "ordinary"
+             :toolName "read" :isError nil :result nil)
+            (should (equal (pilish--nested-call-result call) '(:content [])))
+            (should (eq 'ok (pilish--nested-call-status call)))
+            (should-not (pilish--nested-call-duration-ms call))
+            (pilish-test--nested-event
+             "tool_execution_update" "update-only" "ordinary"
+             :toolName "read" :args '(:path "do not reset")
+             :partialResult '(:content []))
+            (should-not (pilish--nested-call-pending-end-p call)))
+          (dolist (payload '(nil (:content 19)))
+            ;; Each malformed real end gets one result, never a synthetic start.
+            (let ((id (if payload "malformed-end" "end-only")))
+              (pilish-test--nested-event
+               "tool_execution_end" id "ordinary"
+               :toolName "read" :isError t :result payload)
+              (let ((call (pilish--nested-call-get ordinary id)))
+                (should (eq 'error (pilish--nested-call-status call)))
+                (should (equal (pilish--nested-call-result call) '(:content [])))
+                (should-not (pilish--nested-call-started-at call))
+                (should-not (pilish--nested-call-duration-ms call))
+                (should-not (pilish--nested-call-arguments call))
+                (should-not (pilish--nested-call-pending-end-p call)))))
+          (should (equal (mapcar #'pilish--nested-call-id
+                                (pilish--tool-block-nested-calls ordinary))
+                         '("update-only" "end-only" "malformed-end")))
+          (should (= 1 (length (pilish-test--all-tool-overlays)))))))))
+
+(ert-deftest pilish-test-nested-stop-is-not-cancellation-evidence ()
+  "Stop is global intent, not per-call evidence; late repeats keep real outcomes."
+  (let ((dir (pilish-test--make-temp-directory "pilish-nested-stop-")))
+    (unwind-protect
+        (pilish-test-with-mock-session dir
+          (let ((chat (get-buffer (pilish-test--chat-buffer-name dir)))
+                (input (get-buffer (pilish-test--input-buffer-name dir)))
+                (now 10)
+                notices)
+            (with-current-buffer input (insert "draft stays editable"))
+            (with-current-buffer chat
+              (cl-letf (((symbol-function 'current-time)
+                         (lambda () (seconds-to-time now)))
+                        ((symbol-function 'message)
+                         (lambda (fmt &rest args)
+                           (push (apply #'format fmt args) notices))))
+                (pilish--handle-display-event '(:type "agent_start"))
+                (pilish-test--nested-event
+                 "tool_execution_start" "stop-root" nil :toolName "runner"
+                 :args '(:script "owns both children"))
+                ;; An update establishes the obligation but not start timing.
+                (pilish-test--nested-event
+                 "tool_execution_update" "failed" "stop-root" :toolName "bash"
+                 :args '(:command "update arguments") :partialResult '(:content []))
+                (pilish-test--nested-event
+                 "tool_execution_start" "successful" "stop-root" :toolName "read"
+                 :args '(:path "successful.el"))
+                (let* ((root (pilish--tool-block-get "stop-root"))
+                       (failed (pilish--nested-call-get root "failed"))
+                       (successful (pilish--nested-call-get root "successful")))
+                  (pilish-abort)
+                  (should pilish--aborted)
+                  (setq now 12)
+                  (pilish-test--nested-event
+                   "tool_execution_start" "failed" "stop-root" :toolName "bash"
+                   :args '(:command "actual start arguments"))
+                  (should (equal (pilish--nested-call-arguments failed)
+                                 '(:command "actual start arguments")))
+                  (setq now 14
+                        pilish--local-user-message "accepted owner")
+                  (let ((phase pilish--activity-phase))
+                    (pilish-test--nested-event
+                     "tool_execution_end" "failed" "stop-root" :toolName "bash"
+                     :isError t
+                     :result '(:content [(:type "text" :text "generic failure")]))
+                    (pilish-test--nested-event
+                     "tool_execution_end" "successful" "stop-root" :toolName "read"
+                     :isError nil
+                     :result '(:content [(:type "text" :text "success")]))
+                    (should (equal (pilish-test--nested-summary-lines "stop-root" t)
+                                   '(("failed" . "  ✗ bash {\"command\":\"actual start arguments\"} — generic failure")
+                                     ("successful" . "  ✓ read {\"path\":\"successful.el\"}"))))
+                    (should (equal phase pilish--activity-phase))
+                    (should (eq 'streaming pilish--status))
+                    (should pilish--aborted)
+                    (should (equal pilish--local-user-message "accepted owner"))
+                    (should-not pilish--followup-queue)
+                    (should (equal (with-current-buffer input (buffer-string))
+                                   "draft stays editable")))
+                  (should (eq 'error (pilish--nested-call-status failed)))
+                  (should (eq 'ok (pilish--nested-call-status successful)))
+                  (should (= 2000 (pilish--nested-call-duration-ms failed)))
+                  (should (= 4000 (pilish--nested-call-duration-ms successful)))
+                  (pilish-test--nested-event
+                   "tool_execution_end" "stop-root" nil :toolName "runner"
+                   :isError nil :result '(:content []))
+                  (pilish--handle-display-event '(:type "agent_end" :messages []))
+                  (pilish--handle-display-event '(:type "agent_settled"))
+                  (should-not pilish--aborted)
+                  (pilish--handle-display-event '(:type "agent_start"))
+                  (pilish-abort)
+                  (let ((text (buffer-string))
+                        (phase pilish--activity-phase))
+                    (dolist (id '("failed" "successful"))
+                      (pilish-test--nested-event
+                       "tool_execution_start" id "stop-root" :toolName "read"
+                       :args '(:path "must not reset.el"))
+                      (pilish-test--nested-event
+                       "tool_execution_end" id "stop-root" :toolName "read"
+                       :isError nil :result '(:content [])))
+                    (should (eq 'error (pilish--nested-call-status failed)))
+                    (should (eq 'ok (pilish--nested-call-status successful)))
+                    (should (equal text (buffer-string)))
+                    (should (equal phase pilish--activity-phase))
+                    (should (eq 'streaming pilish--status))
+                    (should pilish--aborted)
+                    (should-not pilish--followup-queue)
+                    (should (eq root (pilish--nested-tool-owner "failed")))
+                    (should (eq root (pilish--nested-tool-owner "successful")))
+                    (should (equal (with-current-buffer input (buffer-string))
+                                   "draft stays editable")))
+                  (should (equal notices '("Pi: Aborting..." "Pi: Aborting..."))))))))
+      (delete-directory dir t))))
+
+(defun pilish-test--nested-retained-root ()
+  "Create a real retained root with both completed output and a pending child."
+  (pilish-test--nested-event
+   "tool_execution_start" "reused-root" nil :toolName "runner"
+   :args '(:script "full parent arguments"))
+  (let ((root (pilish--tool-block-get "reused-root")))
+    (pilish-test--nested-event
+     "tool_execution_start" "complete-child" "reused-root"
+     :toolName "read" :args '(:path "complete.el"))
+    (pilish-test--nested-event
+     "tool_execution_end" "complete-child" "reused-root" :toolName "read"
+     :isError nil :result '(:content [(:type "text" :text "full child result")]))
+    (pilish-test--nested-event
+     "tool_execution_start" "pending-child" "reused-root"
+     :toolName "read" :args '(:path "pending.el"))
+    (pilish-test--nested-event
+     "tool_execution_end" "reused-root" nil :toolName "runner"
+     :isError nil :result '(:content [(:type "text" :text "full parent result")]))
+    root))
+
+(ert-deftest pilish-test-codemode-teardown-freezes-details-only-running-rows ()
+  "Exit and replacement freeze model and anonymous running rows as unfinished."
+  ;; A missing execution obligation must not freeze a spinner permanently;
+  ;; normalizing terminal metadata would instead discard actual outcomes.
+  (dolist (boundary '(exit replacement))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((process (make-process :name "pilish-details-exit" :command '("cat")
+                                   :connection-type 'pipe :noquery t :filter #'ignore))
+            (replacement (make-process :name "pilish-details-replacement" :command '("cat")
+                                       :connection-type 'pipe :noquery t :filter #'ignore)))
+        (unwind-protect
+            (progn
+              (pilish--set-process process)
+              (dolist (id '("models" "anonymous"))
+                (pilish-test--nested-event
+                 "tool_execution_start" id nil :toolName "codemode" :args '(:code "await work();"))
+                (pilish-test--nested-event
+                 "tool_execution_update" id nil
+                 :partialResult
+                 (list :content [] :details
+                       (list :calls
+                             (if (equal id "models")
+                                 [(:id "classifier" :name "models.classify" :status "running")
+                                  (:id "images" :name "models.generateImages" :status "running")
+                                  (:id "ok" :name "model-ok" :status "ok")
+                                  (:id "error" :name "model-error" :status "error" :error "denied")
+                                  (:id "cancelled" :name "model-cancelled" :status "cancelled")]
+                               [(:id "anonymous/?" :name "waiting" :status "running")
+                                (:id "anonymous/?" :name "done" :status "ok")
+                                (:id "anonymous/?" :name "failed" :status "error" :error "failed")
+                                (:id "anonymous/?" :name "stopped" :status "cancelled")]))))
+                (pilish-test--flush-tool-updates)
+                (should-not (pilish--nested-pending-p (pilish--nested-tool-owner id))))
+              (should (= 2 (hash-table-count pilish--nested-tool-owners)))
+              (should (equal (cdr (car (pilish-test--nested-summary-lines "models"))) "  … models.classify"))
+              (should (equal (cdr (car (pilish-test--nested-summary-lines "anonymous"))) "  … waiting"))
+              (pcase boundary
+                ('exit (pilish--mark-process-exited process '(:error "Expected exit")))
+                ('replacement (pilish--set-process replacement)))
+              (should (equal (pilish-test--nested-summary-lines "models")
+                             '(("classifier" . "  ? models.classify unfinished")
+                               ("images" . "  ? models.generateImages unfinished")
+                               ("ok" . "  ✓ model-ok")
+                               ("error" . "  ✗ model-error — denied")
+                               ("cancelled" . "  ⊘ model-cancelled"))))
+              (should (equal (pilish-test--nested-summary-lines "anonymous")
+                             '((nil . "  ? waiting unfinished") (nil . "  ✓ done")
+                               (nil . "  ✗ failed — failed") (nil . "  ⊘ stopped"))))
+              (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+              (should-not pilish--tool-update-flush-timer)
+              (should-not (pilish-test--all-tool-overlays))
+              (should-not (text-property-not-all (point-min) (point-max) 'button nil)))
+          (dolist (owned (list process replacement))
+            (when (process-live-p owned) (delete-process owned))))))))
+
+(ert-deftest pilish-test-nested-teardown-and-stale-process-events ()
+  "Every real teardown releases new state; an old closure cannot own a new root."
+  (dolist (boundary '(clear history replacement exit kill))
+    (let* ((chat (generate-new-buffer " *pilish-nested-teardown*"))
+           (first (make-process :name "pilish-nested-old" :command '("cat")
+                                :connection-type 'pipe :noquery t :filter #'ignore))
+           (second (make-process :name "pilish-nested-new" :command '("cat")
+                                 :connection-type 'pipe :noquery t :filter #'ignore))
+           (pilish-quit-without-confirmation t))
+      (unwind-protect
+          (with-current-buffer chat
+            (pilish-chat-mode)
+            (process-put first 'pilish-chat-buffer chat)
+            (pilish--register-display-handler first)
+            (pilish--set-process first)
+            (let* ((old-handler (process-get first 'pilish-display-handler))
+                   (root (pilish-test--nested-retained-root))
+                   (completed (pilish--nested-call-get root "complete-child"))
+                   (pending (pilish--nested-call-get root "pending-child"))
+                   (header (pilish--tool-block-header-end root))
+                   (end (pilish--tool-block-end-marker root))
+                   (owners pilish--nested-tool-owners))
+              ;; An unchanged process is not a teardown.
+              (pilish--set-process first)
+              (should (= 3 (hash-table-count owners)))
+              (should (pilish--nested-call-pending-end-p pending))
+              (pilish-test--nested-event
+               "tool_execution_update" "reused-root" nil
+               :partialResult '(:content [(:type "text" :text "old queued payload")]))
+              (pilish-test--nested-event
+               "tool_execution_update" "pending-child" "reused-root"
+               :toolName "read" :partialResult '(:content []))
+              (should (timerp pilish--tool-update-flush-timer))
+              (should (eq root (cdr (assoc "reused-root" pilish--pending-tool-updates))))
+              (should (marker-buffer header))
+              (should (marker-buffer end))
+              (should (pilish--tool-block-displayed-output root))
+              (pcase boundary
+                ('clear (pilish--clear-render-artifacts))
+                ('history
+                 (pilish--display-session-history
+                  [(:role "assistant" :content [(:type "text" :text "replacement")])]
+                  chat))
+                ('replacement (pilish--set-process second))
+                ('exit (pilish--mark-process-exited first '(:error "Expected exit")))
+                ('kill (set-buffer-modified-p nil) (kill-buffer chat)))
+              (should (= 0 (hash-table-count owners)))
+              (should-not pilish--tool-update-flush-timer)
+              (should-not pilish--pending-tool-updates)
+              (should-not (marker-buffer header))
+              (should-not (marker-buffer end))
+              (should-not (pilish--tool-block-folds root))
+              (should-not (pilish--tool-block-args root))
+              (should-not (pilish--tool-block-result root))
+              (should-not (pilish--tool-block-displayed-output root))
+              (should-not (pilish--tool-block-nested-calls root))
+              (should-not (pilish--nested-call-result completed))
+              (should-not (pilish--nested-call-arguments completed))
+              (should-not (pilish--nested-call-arguments pending))
+              (should-not (pilish--nested-call-started-at pending))
+              (should-not (pilish--nested-call-pending-end-p pending))
+              (when (memq boundary '(replacement exit))
+                (should (eq 'unfinished (pilish--nested-call-status pending)))
+                (should (equal (cdr (assoc "pending-child" (pilish-test--nested-summary-lines "reused-root" t)))
+                               "  ? read {\"path\":\"pending.el\"} unfinished"))
+                (should-not (pilish--find-toggle-button-in-region (point-min) (point-max))))
+              (when (buffer-live-p chat)
+                (should-not (assoc "reused-root" pilish--pending-tool-updates))
+                (pilish--release-nested-tool-state t)
+                (pilish--release-nested-tool-state t)
+                (should (= 0 (hash-table-count owners)))
+                (let ((text (buffer-string)))
+                  (pilish--release-nested-tool-state t)
+                  (should (equal text (buffer-string)))
+                  (funcall old-handler
+                           '(:type "tool_execution_end" :toolCallId "pending-child"
+                             :parentToolCallId "reused-root" :toolName "read"
+                             :isError nil :result (:content [])))
+                  (should (equal text (buffer-string))))
+                ;; Reuse the real root ID on a new process.  Calling an old
+                ;; display closure directly represents an already-dispatched
+                ;; event, even after its process properties are unregistered.
+                (pilish--unregister-display-handler first)
+                (pilish--set-process second)
+                (process-put second 'pilish-chat-buffer chat)
+                (pilish--register-display-handler second)
+                (let* ((new-root (pilish-test--nested-retained-root))
+                       (text (buffer-string))
+                       (phase pilish--activity-phase)
+                       (active (hash-table-count (plist-get pilish--state :active-tools))))
+                  (dolist (event
+                           '((:type "tool_execution_start" :toolCallId "stale-child"
+                              :parentToolCallId "reused-root" :toolName "read"
+                              :args (:path "old process.el"))
+                             (:type "tool_execution_update" :toolCallId "pending-child"
+                              :parentToolCallId "reused-root" :toolName "read"
+                              :args (:path "old process.el") :partialResult (:content []))
+                             (:type "tool_execution_end" :toolCallId "pending-child"
+                              :parentToolCallId "reused-root" :toolName "read"
+                              :isError t :result (:content []))))
+                    (funcall old-handler event))
+                  (should (equal text (buffer-string)))
+                  (should (equal phase pilish--activity-phase))
+                  (should (= active (hash-table-count
+                                     (plist-get pilish--state :active-tools))))
+                  (should-not (pilish--nested-call-get new-root "stale-child"))
+                  (should (pilish--nested-pending-p new-root))
+                  (should (= 2 (length (pilish--tool-block-nested-calls new-root))))
+                  (let ((rows (pilish-test--nested-summary-lines "reused-root" t)))
+                    (should (equal (mapcar #'car (last rows 2)) '("complete-child" "pending-child")))
+                    (should (equal (cdr (car (last rows))) "  … read {\"path\":\"pending.el\"}")))))
+              (unless (buffer-live-p chat)
+                (funcall old-handler
+                         '(:type "tool_execution_start" :toolCallId "after-kill"
+                           :parentToolCallId "reused-root" :toolName "read"
+                           :args (:path "dead.el")))
+                (should (= 0 (hash-table-count owners))))))
+        (when (buffer-live-p chat)
+          (with-current-buffer chat (set-buffer-modified-p nil))
+          (kill-buffer chat))
+        (dolist (process (list first second))
+          (pilish--unregister-display-handler process)
+          (when (process-live-p process) (delete-process process)))))))
+
+;;; Deferred cooling
 
 (ert-deftest pilish-test-deferred-tool-cooling-agent-end-schedules-cohort ()
   "agent_end queues the cold cohort without synchronously rewriting it."
@@ -12625,6 +16579,7 @@ Edit diffs include unchanged context rows with a leading space marker."
      "/ssh:localhost:/tmp/project/")
     (let* ((path "/ssh:127.0.0.1:/tmp/project/src/a.txt")
            (proc (start-process "pilish-render-test-cat" nil "cat"))
+           (pilish--process proc)
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
       (unwind-protect
@@ -12681,6 +16636,7 @@ Edit diffs include unchanged context rows with a leading space marker."
   (with-temp-buffer
     (pilish-chat-mode)
     (let* ((proc (start-process "pilish-render-test-text-cat" nil "cat"))
+           (pilish--process proc)
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
       (unwind-protect
@@ -12711,6 +16667,7 @@ Edit diffs include unchanged context rows with a leading space marker."
   (with-temp-buffer
     (pilish-chat-mode)
     (let* ((proc (start-process "pilish-render-test-thinking-cat" nil "cat"))
+           (pilish--process proc)
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
       (unwind-protect
@@ -12745,6 +16702,7 @@ Edit diffs include unchanged context rows with a leading space marker."
   (with-temp-buffer
     (pilish-chat-mode)
     (let* ((proc (start-process "pilish-render-test-cat" nil "cat"))
+           (pilish--process proc)
            (event '(:type "tool_execution_start"
                     :toolCallId "call_numeric"
                     :toolName "bash"
@@ -12774,6 +16732,7 @@ Edit diffs include unchanged context rows with a leading space marker."
   (with-temp-buffer
     (pilish-chat-mode)
     (let* ((proc (start-process "pilish-render-test-cat" nil "cat"))
+           (pilish--process proc)
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
       (unwind-protect
