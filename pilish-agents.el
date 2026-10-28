@@ -1366,7 +1366,7 @@ The extension reports the outcome with a notification."
   "Return agent type names from the feed or agent definition files."
   (or (mapcar (lambda (ty) (plist-get ty :name)) (plist-get (pilish-agents--view) :types))
       (delete-dups
-       (append '("general-purpose" "Explore" "Plan")
+       (append '("general-purpose")
                (mapcan (lambda (dir)
                          (and (file-directory-p dir)
                               (mapcar #'file-name-base
