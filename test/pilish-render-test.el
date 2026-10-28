@@ -6670,28 +6670,26 @@ See https://github.com/dnouri/pilish/issues/176."
         (let ((pilish--process t))
           (pilish--handle-extension-ui-request
            '(:type "extension_ui_request"
-             :id "req-widget-1"
-             :method "setWidget"
-             :widgetKey "my-ext"
-             :widgetLines ["Line 1"]))
-          (pilish--handle-extension-ui-request
-           '(:type "extension_ui_request"
-             :id "req-widget-2"
-             :method "setWidget"
-             :widgetKey "my-ext"
-             :widgetLines ["Line 2"]))
-          (pilish--handle-extension-ui-request
-           '(:type "extension_ui_request"
-             :id "req-title"
+             :id "req-title-1"
              :method "setTitle"
-             :title "pi - project")))))
+             :title "pi - one"))
+          (pilish--handle-extension-ui-request
+           '(:type "extension_ui_request"
+             :id "req-title-2"
+             :method "setTitle"
+             :title "pi - two"))
+          (pilish--handle-extension-ui-request
+           '(:type "extension_ui_request"
+             :id "req-future"
+             :method "someFutureMethod")))))
     (should (= (length warnings-logged) 2))
-    (should (= 1 (cl-count-if (lambda (m) (string-match-p "setWidget" m))
-                              warnings-logged)))
     (should (= 1 (cl-count-if (lambda (m) (string-match-p "setTitle" m))
                               warnings-logged)))
-    ;; setWidget and setTitle are fire-and-forget RPC methods.
-    (should (null responses-sent))))
+    (should (= 1 (cl-count-if (lambda (m) (string-match-p "someFutureMethod" m))
+                              warnings-logged)))
+    ;; setTitle is fire-and-forget; only the unknown method is cancelled.
+    (should (equal (mapcar (lambda (r) (plist-get r :id)) responses-sent)
+                   '("req-future")))))
 
 (ert-deftest pilish-test-extension-ui-unsupported-warnings-are-buffer-local ()
   "Unsupported extension UI warning dedupe is isolated by chat buffer."
@@ -6713,22 +6711,58 @@ See https://github.com/dnouri/pilish/issues/176."
               (let ((pilish--process t))
                 (pilish--handle-extension-ui-request
                  '(:type "extension_ui_request"
-                   :id "req-widget"
-                   :method "setWidget"
-                   :widgetKey "my-ext"
-                   :widgetLines ["Line 1"])))))
+                   :id "req-title"
+                   :method "setTitle"
+                   :title "pi - one")))))
           (with-current-buffer buf-a
             (let ((pilish--process t))
               (pilish--handle-extension-ui-request
                '(:type "extension_ui_request"
-                 :id "req-widget-again"
-                 :method "setWidget"
-                 :widgetKey "my-ext"
-                 :widgetLines ["Line 2"]))))
-          (should (= 2 (cl-count-if (lambda (m) (string-match-p "setWidget" m))
+                 :id "req-title-again"
+                 :method "setTitle"
+                 :title "pi - two"))))
+          (should (= 2 (cl-count-if (lambda (m) (string-match-p "setTitle" m))
                                     warnings-logged))))
       (when (buffer-live-p buf-a) (kill-buffer buf-a))
       (when (buffer-live-p buf-b) (kill-buffer buf-b)))))
+
+(ert-deftest pilish-test-extension-ui-set-widget-stores-lines ()
+  "setWidget stores string lines by key, runs the hook, and does not warn."
+  (let (warnings hook-calls)
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (when fmt (push (apply #'format fmt args) warnings)))))
+        (let ((pilish-extension-widget-functions
+               (list (lambda (key lines) (push (cons key lines) hook-calls))))
+              (pilish--process t))
+          (pilish--handle-extension-ui-request
+           '(:type "extension_ui_request" :id "w1" :method "setWidget"
+             :widgetKey "agents" :widgetLines ["one" "two"]
+             :widgetPlacement "aboveEditor"))
+          (should (equal (pilish--extension-widget-lines "agents") '("one" "two")))
+          (should (equal (plist-get (cdr (assoc "agents" pilish--extension-widgets))
+                                    :placement)
+                         "aboveEditor"))
+          (pilish--handle-extension-ui-request
+           '(:type "extension_ui_request" :id "w2" :method "setWidget"
+             :widgetKey "agents"))
+          (should-not (pilish--extension-widget-lines "agents"))
+          (should-not (assoc "agents" pilish--extension-widgets)))))
+    (should (equal (reverse hook-calls) '(("agents" "one" "two") ("agents"))))
+    (should-not (cl-some (lambda (m) (string-match-p "extension UI method" m)) warnings))))
+
+(ert-deftest pilish-test-header-extension-status-command ()
+  "A status key mapped to a command gets a header-line mouse binding."
+  (let* ((pilish-extension-status-commands '(("subagents" . ignore)))
+         (text (pilish--header-format-extension-status
+                '(("subagents" . "2 running agents") ("other" . "x"))))
+         (pos (string-match "2 running" text))
+         (other (string-match "x\\'" text)))
+    (should (eq (lookup-key (get-text-property pos 'local-map text) [header-line mouse-1])
+                'ignore))
+    (should-not (get-text-property other 'local-map text))))
 
 (ert-deftest pilish-test-header-format-extension-status ()
   "Extension status formatter returns inline neutral status text without pipe."

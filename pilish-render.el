@@ -1325,6 +1325,20 @@ completes normally."
             (assoc-delete-all key pilish--extension-status)))
     (force-mode-line-update t)))
 
+(defun pilish--extension-ui-set-widget (event)
+  "Handle setWidget method from EVENT by storing its string lines.
+Pi forwards only string-array widgets; an absent array clears the key."
+  (let* ((key (plist-get event :widgetKey))
+         (raw (plist-get event :widgetLines))
+         (lines (and (or (vectorp raw) (consp raw))
+                     (delq nil (mapcar (lambda (line)
+                                         (and (stringp line)
+                                              (pilish--render-safe-string line)))
+                                       (append raw nil))))))
+    (when (stringp key)
+      (pilish--set-extension-widget key lines
+                                    (plist-get event :widgetPlacement)))))
+
 ;; Pi RPC currently suppresses this method; retain client protocol support.
 (defun pilish--extension-ui-set-working-message (event)
   "Handle setWorkingMessage method from EVENT."
@@ -1378,6 +1392,7 @@ Dispatches to appropriate handler based on method."
       ("input"          (pilish--extension-ui-input event proc))
       ("set_editor_text" (pilish--extension-ui-set-editor-text event))
       ("setStatus"      (pilish--extension-ui-set-status event))
+      ("setWidget"      (pilish--extension-ui-set-widget event))
       ("setWorkingMessage" (pilish--extension-ui-set-working-message event))
       (_                (pilish--extension-ui-unsupported event proc)))))
 

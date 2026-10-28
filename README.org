@@ -612,6 +612,7 @@ The main buffers:
 | =C-c C-k=                 | input, chat  | Abort current response or compaction        |
 | =C-c C-p=                 | input, chat  | Open the transient menu                     |
 | =C-c C-r=                 | input, chat  | Browse sessions                             |
+| =C-c C-a=                 | input, chat  | Subagents menu (also =A= in =C-c C-p=)      |
 | =C-c C-p a i=             | menu         | Attach or replace one prompt image          |
 | =C-u C-c C-p a i=         | menu         | Clear the attached prompt image             |
 | =M-p= / =M-n=             | input        | Prompt history (=C-↑= / =C-↓= also work)    |
@@ -1181,7 +1182,9 @@ and show status text.
 
 Rich TUI-specific extension UI is not supported in Emacs yet: custom
 widgets, custom editor components, custom headers/footers, and other
-component-based views are unavailable or fall back.  Hover extension
+component-based views are unavailable or fall back.  String-array
+widgets are stored for Pilish features that consume them, such as the
+subagents menu, but are not drawn on screen.  Hover extension
 status text in the header line to see the exact =statusKey=, which you
 can use to change the font for that extension's status text using
 =pilish-extension-status-faces=.
@@ -1243,6 +1246,44 @@ unavailable labels.  See the variable's docstring for the full contract.
 pi-submarine publishes exactly one item per result, its immediate
 child.  Deeper saved results carry their own declarations inside that
 child.
+
+*** Subagents menu
+
+=C-c C-a= (or =A= in =C-c C-p=, or clicking the =subagents= status in
+the header line) opens a transient for the session's subagents and
+workflows from the pi-subagents extension.  The top lists agents and
+workflows with live status, elapsed time, tool count, and tokens;
+the panel below shows the selected item's details and recent output, or
+a workflow's phases and steps.
+
+| Key         | Action                                                        |
+|-------------+---------------------------------------------------------------|
+| =1=–=0=     | Select a listed item                                          |
+| =n= / =p=   | Next or previous item (scrolls past the first ten)            |
+| =s=         | Steer the selected running agent                              |
+| =k= / =x=   | Interrupt (resumable) or stop the selected agent              |
+| =R=         | Resume a finished agent with a new prompt                     |
+| =N=         | Spawn a new agent                                             |
+| =P=         | Pause or resume the selected workflow                         |
+| =K=         | Kill the selected workflow                                    |
+| =S= / =Y=   | Skip or retry a workflow step                                 |
+| =RET=       | Show the agent's full status and recent output                |
+| =o=         | Open the agent's conversation read-only                       |
+| =y= / =i=   | Copy the id, or insert a reference into the prompt draft      |
+| =f=         | Cycle the filter: recent, active, all                         |
+| =g=         | Refresh                                                       |
+| =D=         | Toggle a demo fleet                                           |
+
+The header badge names the data source.  With =live · subagents:state=,
+pi-subagents publishes its state over RPC and controls are sent as
+=/agents VERB ...= commands; verbs the extension does not advertise are
+greyed out.  With =read-only · child sessions on disk=, Pilish lists
+session files whose header names this session as =parentSession=, infers
+their status, and opens them with =o=; controls only report the command
+they would send.  =DEMO · stub data= is an animated sample fleet for
+trying the menu.  The feed contract is in the Commentary of
+=pilish-agents.el=, and =M-x pilish-agents-feed-example= shows the
+current view as an example payload.
 
 ** MCP servers
 

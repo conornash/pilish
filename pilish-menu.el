@@ -47,6 +47,7 @@
 
 (declare-function pilish-session-browser "pilish-browse")
 (declare-function pilish-tree-browser "pilish-browse")
+(declare-function pilish-agents-menu "pilish-agents")
 
 (defconst pilish--minimum-transient-version "0.9.0"
   "Minimum supported transient version.")
@@ -362,6 +363,7 @@ Call this when starting a new session to ensure no stale state persists."
         pilish--assistant-header-shown nil
         pilish--local-user-message nil
         pilish--extension-status nil
+        pilish--extension-widgets nil
         pilish--working-message nil
         pilish--pre-compaction-status nil
         pilish--in-code-block nil
@@ -1381,6 +1383,7 @@ Uses commands from pi's `get_commands' RPC."
     ("RET" "send" pilish-send)
     ("s" "steer" pilish-queue-steering)
     ("a" "attach" pilish-attach-menu)
+    ("A" "agents" pilish-agents-menu)
     ("k" "abort" pilish-abort)]]
   [["Model"
     ("m" "select" pilish-select-model)

@@ -1970,6 +1970,43 @@ Keys are extension identifiers (strings), values are status text.")
 (defvar-local pilish--working-message nil
   "Transient extension working message for header-line display.")
 
+(defvar-local pilish--extension-widgets nil
+  "Alist of extension widget contents keyed by `widgetKey'.
+Each value is a plist (:lines LINES :placement PLACEMENT) where LINES is
+a list of strings.  Pi forwards only string-array widgets over RPC.
+Pilish stores widgets for consumers such as `pilish-agents'; it has no
+generic on-screen widget display.")
+
+(defvar pilish-extension-data-widget-keys nil
+  "Extension widget keys whose lines are data for Emacs, never display text.
+Pilish never draws widgets itself; this tells packages that do, such as
+pi-ext-ui, to leave these keys alone.  Consumers add their own keys.")
+
+(defvar pilish-extension-widget-functions nil
+  "Abnormal hook run in the chat buffer after an extension widget change.
+Each function receives KEY and LINES; LINES is nil when the widget was
+cleared.")
+
+(defun pilish--set-extension-widget (key lines &optional placement)
+  "Store extension widget KEY with LINES and PLACEMENT, or clear it.
+LINES nil removes KEY.  Run `pilish-extension-widget-functions'."
+  (setq pilish--extension-widgets (assoc-delete-all key pilish--extension-widgets))
+  (when lines
+    (push (cons key (list :lines lines :placement placement))
+          pilish--extension-widgets))
+  (run-hook-with-args 'pilish-extension-widget-functions key lines))
+
+(defun pilish--extension-widget-lines (key &optional buffer)
+  "Return the stored lines for extension widget KEY in BUFFER.
+BUFFER defaults to the current buffer."
+  (plist-get (cdr (assoc key (buffer-local-value 'pilish--extension-widgets
+                                                 (or buffer (current-buffer)))))
+             :lines))
+
+(defvar pilish-extension-status-commands nil
+  "Alist mapping extension `statusKey' strings to commands.
+Clicking a mapped status segment in the header line runs its command.")
+
 (defvar-local pilish--unsupported-extension-ui-methods-warned nil
   "Unsupported extension UI method names already warned for this pi session.")
 
@@ -3051,9 +3088,21 @@ Returns extension statuses joined with \" · \", or empty string."
                  (let* ((key (car pair))
                         (text (pilish--header-escape-text (cdr pair)))
                         (face (cdr (assoc key pilish-extension-status-faces)))
+                        (command (and (stringp key)
+                                      (cdr (assoc key pilish-extension-status-commands))))
                         (properties (and (stringp key)
-                                         (list 'help-echo key
+                                         (list 'help-echo
+                                               (if command
+                                                   (format "%s: mouse-1 runs %s" key command)
+                                                 key)
                                                'mouse-face 'highlight))))
+                   (when command
+                     (setq properties
+                           (append properties
+                                   (list 'local-map
+                                         (let ((map (make-sparse-keymap)))
+                                           (define-key map [header-line mouse-1] command)
+                                           map)))))
                    (when face
                      (setq properties (append properties (list 'face face))))
                    (if properties
