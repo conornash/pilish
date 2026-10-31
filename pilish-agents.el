@@ -42,11 +42,16 @@
 ;;
 ;;   Agent: {id, name?, handle?, parentAgentId?, depth?, type, description,
 ;;           status, background, model?, thinking?, toolUses, turnCount?, maxTurns?,
-;;           tokens, cost?, startedAt, completedAt?, activity?,
+;;           tokens, contextTokens?, contextWindow?, cost?, startedAt,
+;;           completedAt?, activity?,
 ;;           recent: [{kind, text}], resultPreview?, error?,
 ;;           sessionFile?, sessionId?, outputFile?}
 ;;     status: queued|running|completed|steered|aborted|stopped|
 ;;             interrupted|error
+;;     tokens is the lifetime input+output+cache-write total.  Every turn
+;;     re-sends the context, so it grows far past the context size; the
+;;     menu shows it only as a Σ total.  contextTokens is the current
+;;     context (pi's estimate) and is what the menu reports as ctx.
 ;;     recent.kind: text|tool|steer (also thinking|status here), newest last
 ;;     parentAgentId names the agent that spawned this one through its own
 ;;     scoped Agent tool (a nested child); depth counts from the main
@@ -788,6 +793,29 @@ only as a tiebreak, since the tree, not the feed, decides indentation."
       (concat (pilish-agents--duration (- (pilish-agents--now-ms) ms)) " ago")
     ""))
 
+(defun pilish-agents--context-column (agent)
+  "Return AGENT's token column: its context size, or a marked lifetime total.
+The lifetime total counts the whole context once per turn, so it is shown
+with a Σ and never in place of the context unmarked."
+  (let ((ctx (pilish-agents--get agent :contextTokens))
+        (total (pilish-agents--get agent :tokens)))
+    (cond ((numberp ctx) (pilish-agents--tokens ctx))
+          ((numberp total) (concat "Σ" (pilish-agents--tokens total)))
+          (t ""))))
+
+(defun pilish-agents--context-detail (agent)
+  "Return AGENT's context and lifetime-token detail, or nil."
+  (let ((ctx (pilish-agents--get agent :contextTokens))
+        (window (pilish-agents--get agent :contextWindow))
+        (total (pilish-agents--get agent :tokens)))
+    (pilish-agents--join-meta
+     (and (numberp ctx)
+          (if (and (numberp window) (> window 0))
+              (format "ctx %s/%s (%d%%)" (pilish-agents--tokens ctx)
+                      (pilish-agents--tokens window) (round (* 100.0 (/ (float ctx) window))))
+            (concat "ctx " (pilish-agents--tokens ctx))))
+     (and (numberp total) (concat "Σ " (pilish-agents--tokens total) " tok lifetime")))))
+
 (defun pilish-agents--tokens (n)
   "Format token count N."
   (cond ((not (numberp n)) "")
@@ -852,10 +880,7 @@ A nested child is indented under its parent, its label prefixed with a corner."
                                      7 t)
                  (pilish-agents--pad (format "%s tools" (or (pilish-agents--get agent :toolUses) 0))
                                      10 t)
-                 (pilish-agents--pad (pilish-agents--tokens
-                                      (or (pilish-agents--get agent :tokens)
-                                          (pilish-agents--get agent :contextTokens)))
-                                     7 t))
+                 (pilish-agents--pad (pilish-agents--context-column agent) 8 t))
                 'face 'pilish-agents-meta))))
     (pilish-agents--mark-selected row selected)))
 
@@ -895,9 +920,10 @@ A nested child is indented under its parent, its label prefixed with a corner."
                         (pilish-agents--pad (format "%s tools"
                                                     (or (pilish-agents--get wf :totalToolCalls) 0))
                                             10 t)
-                        (pilish-agents--pad (pilish-agents--tokens
-                                             (pilish-agents--get wf :totalTokens))
-                                            7 t))
+                        (pilish-agents--pad (if-let* ((n (pilish-agents--get wf :totalTokens)))
+                                                (concat "\N{N-ARY SUMMATION}" (pilish-agents--tokens n))
+                                              "")
+                                            8 t))
                 'face 'pilish-agents-meta))))
     (pilish-agents--mark-selected row selected)))
 
@@ -954,9 +980,7 @@ A nested child is indented under its parent, its label prefixed with a corner."
                   (concat "ended " (pilish-agents--ago (pilish-agents--get agent :completedAt))))
              (and turns (if max-turns (format "turn %d/%d" turns max-turns) (format "%d turns" turns)))
              (format "%d tools" (or (pilish-agents--get agent :toolUses) 0))
-             (let ((tok (or (pilish-agents--get agent :tokens)
-                            (pilish-agents--get agent :contextTokens))))
-               (and tok (concat (pilish-agents--tokens tok) " tok")))
+             (pilish-agents--context-detail agent)
              (and (numberp cost) (> cost 0) (format "$%.2f" cost))
              (and (pilish-agents--get agent :name) (pilish-agents--get agent :type))
              (pilish-agents--get agent :model)
@@ -1066,7 +1090,8 @@ Keep display order and at most `pilish-agents--workflow-step-limit'."
                      (seq-count (lambda (a) (equal (plist-get a :state) "done")) agents)
                      (length agents))
              (format "%d tools" (or (pilish-agents--get wf :totalToolCalls) 0))
-             (concat (pilish-agents--tokens (pilish-agents--get wf :totalTokens)) " tok")))
+             (concat "\N{N-ARY SUMMATION} " (pilish-agents--tokens (pilish-agents--get wf :totalTokens))
+                     " tok lifetime")))
            (pilish-agents--panel-line
             (mapconcat
              (lambda (p)

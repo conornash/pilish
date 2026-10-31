@@ -336,7 +336,16 @@
                (pilish-agents-test--agent "a1" "completed" :completedAt 66000 :tokens 12345)
                t))))
     (should (string-prefix-p "▸✓ Explore" row))
-    (should (string-match-p "task a1 +completed +1m05s +3 tools +12k" row))))
+    (should (string-match-p "task a1 +completed +1m05s +3 tools +Σ12k" row))))
+
+(ert-deftest pilish-agents-test-context-not-lifetime-tokens ()
+  "The token column is the current context; the lifetime total never stands in unmarked."
+  (let ((agent (pilish-agents-test--agent "a1" "running" :tokens 912000
+                                          :contextTokens 184000 :contextWindow 200000)))
+    (should (string-match-p "tools +184k\\'"
+                            (substring-no-properties (pilish-agents--agent-row agent nil))))
+    (should (equal (substring-no-properties (pilish-agents--context-detail agent))
+                   "ctx 184k/200k (92%) · Σ 912k tok lifetime"))))
 
 (ert-deftest pilish-agents-test-workflow-steps-capped ()
   "Long workflows list unfinished steps and the newest finished ones."
