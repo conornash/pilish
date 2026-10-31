@@ -40,14 +40,19 @@
 ;;    types: [{name, description?}],
 ;;    agents: [Agent], workflows: [Workflow]}
 ;;
-;;   Agent: {id, name?, handle?, type, description, status, background,
-;;           model?, thinking?, toolUses, turnCount?, maxTurns?,
+;;   Agent: {id, name?, handle?, parentAgentId?, depth?, type, description,
+;;           status, background, model?, thinking?, toolUses, turnCount?, maxTurns?,
 ;;           tokens, cost?, startedAt, completedAt?, activity?,
 ;;           recent: [{kind, text}], resultPreview?, error?,
 ;;           sessionFile?, sessionId?, outputFile?}
 ;;     status: queued|running|completed|steered|aborted|stopped|
 ;;             interrupted|error
 ;;     recent.kind: text|tool|steer (also thinking|status here), newest last
+;;     parentAgentId names the agent that spawned this one through its own
+;;     scoped Agent tool (a nested child); depth counts from the main
+;;     session, its subagents being 1.  Children are listed under their
+;;     parent and can be steered, interrupted, or stopped; resume is
+;;     refused by pi-subagents, since only the parent reads a child's result.
 ;;
 ;;   Workflow: {id, name, description?, status, startedAt, endedAt?,
 ;;              pausedMs, pausedAt?, phases: [{index, title}], phaseIndex,
@@ -438,6 +443,12 @@ PROPS override defaults."
        :activity "edit src/ui/agent-widget.ts" :recent (pilish-agents--demo-recent 4)
        :demoFinishAt (+ now 420000))
       (pilish-agents--demo-agent
+       "c4c4c4c4c4c4c4c4c" "Explore" "Locate setWidget call sites" "running" 61
+       :parentAgentId "9f8e7d6c5b4a39281" :depth 2
+       :model "claude-haiku-4-5" :toolUses 7 :turnCount 4 :tokens 15300 :cost 0.01
+       :activity "grep setWidget src/" :recent (pilish-agents--demo-recent 3)
+       :demoFinishAt (+ now 90000))
+      (pilish-agents--demo-agent
        "5e5e5e5e5e5e5e5e5" "Plan" "Design /agents control verbs" "queued" 3
        :model "claude-opus-5" :thinking "high"
        :activity "queued — waiting for a background slot (1 ahead)")
@@ -617,19 +628,78 @@ PROPS override defaults."
   "Return the session's current agent list filter."
   (buffer-local-value 'pilish-agents--filter (pilish-agents--chat)))
 
+(defun pilish-agents--parent-id (agent)
+  "Return the id of AGENT's parent when it is a nested child, else nil."
+  (let ((id (pilish-agents--get agent :parentAgentId)))
+    (and (stringp id) (not (string-empty-p id)) id)))
+
+(defun pilish-agents--nested-p (agent)
+  "Return non-nil when AGENT is a nested child of another agent."
+  (and (pilish-agents--parent-id agent) t))
+
+(defun pilish-agents--child-agents (agents parent)
+  "Return the members of AGENTS whose parent is PARENT, active first."
+  (let ((id (plist-get parent :id)))
+    (pilish-agents--sort
+     (seq-filter (lambda (a) (equal (pilish-agents--parent-id a) id)) agents))))
+
+(defun pilish-agents--with-children (agents roots)
+  "Return ROOTS in order, each followed by its descendants from AGENTS.
+A child is listed under its parent whatever its own status, so a parent's
+subtree reads as one unit.  Children whose parent is not in AGENTS at all
+are treated as roots by the caller."
+  (let (out)
+    (dolist (root roots)
+      (push root out)
+      (dolist (child (pilish-agents--with-children
+                      agents (pilish-agents--child-agents agents root)))
+        (push child out)))
+    (nreverse out)))
+
+(defun pilish-agents--roots (agents)
+  "Return the members of AGENTS that head a tree: top-level, or orphaned."
+  (let ((ids (mapcar (lambda (a) (plist-get a :id)) agents)))
+    (seq-remove (lambda (a)
+                  (let ((parent (pilish-agents--parent-id a)))
+                    (and parent (member parent ids))))
+                agents)))
+
 (defun pilish-agents--filtered-agents (view)
-  "Return VIEW's agents after the session's current filter."
-  (let* ((sorted (pilish-agents--sort (plist-get view :agents)))
+  "Return VIEW's agents after the session's current filter, as a tree.
+The filter applies to the roots; a root that is shown brings every
+descendant with it, indented in the rows by `pilish-agents--depth'."
+  (let* ((agents (plist-get view :agents))
+         (sorted (pilish-agents--sort (pilish-agents--roots agents)))
          (active (seq-filter (lambda (a) (member (plist-get a :status)
                                                  pilish-agents--active-statuses))
                              sorted))
          (finished (seq-remove (lambda (a) (member (plist-get a :status)
                                                    pilish-agents--active-statuses))
-                               sorted)))
-    (pcase (pilish-agents--filter)
-      ('active active)
-      ('all sorted)
-      (_ (append active (seq-take finished pilish-agents-recent-finished))))))
+                               sorted))
+         (roots (pcase (pilish-agents--filter)
+                  ('active active)
+                  ('all sorted)
+                  (_ (append active (seq-take finished pilish-agents-recent-finished))))))
+    (pilish-agents--with-children agents roots)))
+
+(defun pilish-agents--depth (agent &optional agents)
+  "Return AGENT's nesting depth within AGENTS (the current view by default).
+A root is 0; a child one more than its parent.  Reads the feed's `depth'
+only as a tiebreak, since the tree, not the feed, decides indentation."
+  (let ((agents (or agents
+                    (and (pilish-agents--parent-id agent)
+                         (plist-get (pilish-agents--view) :agents))))
+        (depth 0)
+        (seen nil)
+        (cur agent))
+    (while (and cur agents
+                (pilish-agents--parent-id cur)
+                (not (member (plist-get cur :id) seen)))
+      (push (plist-get cur :id) seen)
+      (setq cur (seq-find (lambda (a) (equal (plist-get a :id) (pilish-agents--parent-id cur)))
+                          agents))
+      (when cur (setq depth (1+ depth))))
+    depth))
 
 (defun pilish-agents--items (view)
   "Return VIEW's selectable items as (KIND . PLIST), in display order."
@@ -756,12 +826,17 @@ A paused workflow's clock stops at its `pausedAt'."
   (if (stringp id) (substring id 0 (min 8 (length id))) ""))
 
 (defun pilish-agents--agent-row (agent selected)
-  "Return the menu row for AGENT; SELECTED highlights it."
+  "Return the menu row for AGENT; SELECTED highlights it.
+A nested child is indented under its parent, its label prefixed with a corner."
   (let* ((status (plist-get agent :status))
          (finished (not (member status pilish-agents--active-statuses)))
+         (depth (pilish-agents--depth agent))
+         (indent (if (> depth 0)
+                     (concat (make-string (* 2 (1- depth)) ?\s) "\N{BOX DRAWINGS LIGHT UP AND RIGHT} ")
+                   ""))
          (row (concat
                (pilish-agents--glyph status) " "
-               (propertize (pilish-agents--pad (pilish-agents--label agent) 18)
+               (propertize (pilish-agents--pad (concat indent (pilish-agents--label agent)) 18)
                            'face 'pilish-agents-type)
                " "
                (propertize (pilish-agents--pad (plist-get agent :description)
@@ -886,6 +961,27 @@ A paused workflow's clock stops at its `pausedAt'."
              (and (pilish-agents--get agent :name) (pilish-agents--get agent :type))
              (pilish-agents--get agent :model)
              (pilish-agents--get agent :thinking))))))
+    (let* ((agents (plist-get (pilish-agents--view) :agents))
+           (parent-id (pilish-agents--parent-id agent))
+           (parent (and parent-id
+                        (seq-find (lambda (a) (equal (plist-get a :id) parent-id)) agents)))
+           (children (pilish-agents--child-agents agents agent))
+           (kin (pilish-agents--join-meta
+                 (and parent-id
+                      (format "child of %s"
+                              (if parent
+                                  (format "%s · %s" (pilish-agents--label parent)
+                                          (pilish-agents--pad (plist-get parent :description) 40))
+                                (pilish-agents--short-id parent-id))))
+                 (and children
+                      (format "%d child agent%s (%d running)"
+                              (length children) (if (= 1 (length children)) "" "s")
+                              (seq-count (lambda (a) (member (plist-get a :status)
+                                                             pilish-agents--active-statuses))
+                                         children))))))
+      (unless (string-empty-p kin)
+        (setq lines (append lines (list (pilish-agents--panel-line
+                                         (concat "└ " kin) 'pilish-agents-meta))))))
     (when-let* ((activity (pilish-agents--get agent :activity)))
       (setq lines (append lines (list (pilish-agents--panel-line
                                        (concat "⟳ " (pilish-agents--pad activity width))
@@ -1188,9 +1284,12 @@ Stub sources keep every control usable so the menu can be explored."
   (pilish-agents--allowed-p "spawn"))
 
 (defun pilish-agents--can-resume-p ()
-  "Return non-nil when the selected agent can be resumed."
+  "Return non-nil when the selected agent can be resumed.
+A nested child cannot: only its parent reads what it produces, so
+pi-subagents refuses the verb."
   (and (pilish-agents--agent-status-p
         '("completed" "steered" "interrupted" "stopped" "aborted" "error"))
+       (not (pilish-agents--nested-p (pilish-agents--selected-agent)))
        (pilish-agents--allowed-p "resume")))
 
 (defun pilish-agents--has-session-p ()

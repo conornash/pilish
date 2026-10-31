@@ -237,6 +237,98 @@
       (pilish-agents-cycle-filter)
       (should (= 4 (length (pilish-agents--filtered-agents (pilish-agents--view))))))))
 
+(ert-deftest pilish-agents-test-nested-children-follow-parent ()
+  "A nested child is listed under its parent, whatever the sort or filter."
+  (pilish-agents-test--with-chat
+    (pilish-agents--inject-feed
+     chat (pilish-agents-test--feed
+           ;; Newest first in the feed, as the manager lists them: the child
+           ;; and a later top-level agent both precede the parent.
+           (pilish-agents-test--agent "late" "running" :startedAt 5000)
+           (pilish-agents-test--agent "c1" "completed" :parentAgentId "p1" :depth 2
+                                      :startedAt 4000 :completedAt 4500)
+           (pilish-agents-test--agent "g1" "running" :parentAgentId "c1" :depth 3
+                                      :startedAt 4200)
+           (pilish-agents-test--agent "p1" "running" :startedAt 1000)))
+    (let ((ids (lambda (view) (mapcar (lambda (a) (plist-get a :id))
+                                      (pilish-agents--filtered-agents view)))))
+      ;; Roots sort as before; each root's subtree follows it, so the
+      ;; finished child is not pushed below the active roots.
+      (should (equal (funcall ids (pilish-agents--refresh)) '("late" "p1" "c1" "g1")))
+      ;; The `active' filter judges roots only: the finished child stays
+      ;; with its running parent.
+      (pilish-agents-cycle-filter)
+      (should (equal (funcall ids (pilish-agents--view)) '("late" "p1" "c1" "g1"))))
+    (let ((view (pilish-agents--view)))
+      (should (= 0 (pilish-agents--depth (pilish-agents-test--agent "p1" "running")
+                                         (plist-get view :agents))))
+      (should (= 1 (pilish-agents--depth
+                    (seq-find (lambda (a) (equal (plist-get a :id) "c1"))
+                              (plist-get view :agents))
+                    (plist-get view :agents))))
+      (should (= 2 (pilish-agents--depth
+                    (seq-find (lambda (a) (equal (plist-get a :id) "g1"))
+                              (plist-get view :agents))
+                    (plist-get view :agents)))))
+    ;; Rows indent by depth with a corner, within the label column.
+    (let ((row (substring-no-properties
+                (pilish-agents--agent-row
+                 (seq-find (lambda (a) (equal (plist-get a :id) "g1"))
+                           (plist-get (pilish-agents--view) :agents))
+                 nil))))
+      (should (string-match-p "^ . +\u2514 Explore" row)))
+    ;; The detail panel names the kin both ways.
+    (let ((agents (plist-get (pilish-agents--view) :agents)))
+      (should (string-match-p "child of Explore"
+                              (substring-no-properties
+                               (pilish-agents--agent-detail
+                                (seq-find (lambda (a) (equal (plist-get a :id) "c1")) agents)))))
+      (should (string-match-p "1 child agent (0 running)"
+                              (substring-no-properties
+                               (pilish-agents--agent-detail
+                                (seq-find (lambda (a) (equal (plist-get a :id) "p1")) agents))))))))
+
+(ert-deftest pilish-agents-test-nested-child-orphan-is-a-root ()
+  "A child whose parent is not in the feed is listed as a root, not lost."
+  (pilish-agents-test--with-chat
+    (pilish-agents--inject-feed
+     chat (pilish-agents-test--feed
+           (pilish-agents-test--agent "c1" "running" :parentAgentId "gone" :depth 2)))
+    (should (equal (mapcar (lambda (a) (plist-get a :id))
+                           (pilish-agents--filtered-agents (pilish-agents--refresh)))
+                   '("c1")))
+    (should (= 0 (pilish-agents--depth
+                  (car (plist-get (pilish-agents--view) :agents))
+                  (plist-get (pilish-agents--view) :agents))))))
+
+(ert-deftest pilish-agents-test-nested-child-controls ()
+  "A child can be steered, interrupted and stopped, but never resumed."
+  (pilish-agents-test--with-chat
+    (pilish-agents--inject-feed
+     chat (pilish-agents-test--feed
+           (pilish-agents-test--agent "p1" "running")
+           (pilish-agents-test--agent "c1" "running" :parentAgentId "p1" :depth 2)
+           (pilish-agents-test--agent "c2" "interrupted" :parentAgentId "p1" :depth 2
+                                      :completedAt 2000)
+           (pilish-agents-test--agent "t1" "interrupted" :completedAt 2000)))
+    (pilish-agents--refresh)
+    (with-current-buffer chat (setq pilish-agents--selected (cons 'agent "c1")))
+    (should (pilish-agents--can-steer-p))
+    (should (pilish-agents--can-interrupt-p))
+    (should (pilish-agents--can-stop-p))
+    (should-not (pilish-agents--can-resume-p))
+    (with-current-buffer chat (setq pilish-agents--selected (cons 'agent "c2")))
+    (should-not (pilish-agents--can-resume-p))
+    (with-current-buffer chat (setq pilish-agents--selected (cons 'agent "t1")))
+    (should (pilish-agents--can-resume-p))
+    ;; The control goes out addressed to the child's id.
+    (let (sent)
+      (cl-letf (((symbol-function 'pilish-agents--send-control)
+                 (lambda (text) (push text sent))))
+        (with-current-buffer chat (setq pilish-agents--selected (cons 'agent "c1")))
+        (pilish-agents--request "interrupt" "c1")
+        (should (equal sent '("/agents interrupt c1")))))))
+
 (ert-deftest pilish-agents-test-agent-row-columns ()
   "Rows show glyph, label, description, status, and counters."
   (let ((row (substring-no-properties
