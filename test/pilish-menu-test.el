@@ -1676,6 +1676,19 @@ Pi v0.51.3+ renamed SlashCommandSource from \"template\" to \"prompt\"."
           (should (transient-get-suffix 'pilish-menu '(3))))
       (ignore-errors (transient-remove-suffix 'pilish-menu '(3))))))
 
+(ert-deftest pilish-test-rebuild-menu-omits-excluded-command-sections ()
+  "A source missing from `pilish-menu-command-sections' gets no column or key."
+  (let ((pilish--commands
+         '((:name "tool" :description "Ext" :source "extension")
+           (:name "skill:x" :description "Skill" :source "skill")))
+        (pilish-menu-command-sections '("extension" "prompt")))
+    (unwind-protect
+        (progn
+          (pilish--rebuild-commands-menu)
+          (should (transient-get-suffix 'pilish-menu "E"))
+          (should-not (ignore-errors (transient-get-suffix 'pilish-menu "S"))))
+      (ignore-errors (transient-remove-suffix 'pilish-menu '(3))))))
+
 (defun pilish-test--suffix-key-bound-p (key)
   "Return non-nil if KEY is bound in current transient suffixes."
   (cl-find-if (lambda (obj) (equal (oref obj key) key))

@@ -1609,14 +1609,26 @@ Press letter to run, Shift+letter to edit source file."
 
 ;;;; Main Menu Command Sections
 
+(defcustom pilish-menu-command-sections '("extension" "skill" "prompt")
+  "Command sources shown as columns in `pilish-menu'.
+Each of \"extension\", \"skill\" and \"prompt\" adds a column with a few
+quick-access commands and a key (E, S or T) for the full submenu.
+Leave a source out to drop its column and free its key."
+  :type '(set (const :tag "Extensions (E)" "extension")
+              (const :tag "Skills (S)" "skill")
+              (const :tag "Templates (T)" "prompt"))
+  :group 'pilish)
+
 (defun pilish--rebuild-commands-menu ()
   "Rebuild command entries in transient menu.
 Groups commands by source (extension, skill, template) with up to 3
 quick-access commands per category and links to full submenus.
 Sections are displayed side-by-side to use horizontal space."
-  (let* ((extensions (pilish--commands-by-source "extension"))
-         (skills (pilish--commands-by-source "skill"))
-         (templates (pilish--commands-by-source "prompt"))
+  (let* ((shown-p (lambda (source) (member source pilish-menu-command-sections)))
+         (extensions (and (funcall shown-p "extension")
+                          (pilish--commands-by-source "extension")))
+         (skills (and (funcall shown-p "skill") (pilish--commands-by-source "skill")))
+         (templates (and (funcall shown-p "prompt") (pilish--commands-by-source "prompt")))
          (columns '())
          (key 1))
     ;; Remove existing command group (index 3 if it exists)
